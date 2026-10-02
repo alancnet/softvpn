@@ -1,7 +1,10 @@
 # softvpn end-to-end test.
 #
-#   wan   (10.231.10.0/24, has internet)  server  web
-#   edge  (10.231.20.0/24, internal: no route anywhere)  server  client1  client2  probe
+#   wan   (${SVT_NET}.10.0/24, has internet)  server  web
+#   edge  (${SVT_NET}.20.0/24, internal: no route anywhere)  server  clients  probe
+#
+# SVT_ID / SVT_NET (set by run.sh) keep parallel runs apart: project name,
+# image tags and subnets all derive from them.
 #
 # The clients only sit on "edge", which Docker keeps isolated, so anything they
 # reach on "wan" or the internet must have gone through the VPN and been
@@ -12,7 +15,7 @@
 #          client it needs a TUN device, so it gets /dev/net/tun and
 #          NET_ADMIN (nothing else).
 
-name: softvpn-test
+name: softvpn-test${SVT_ID:-}
 
 x-locked-down: &locked-down
   read_only: true
@@ -22,11 +25,11 @@ x-locked-down: &locked-down
 networks:
   wan:
     ipam:
-      config: [{ subnet: 10.231.10.0/24 }]
+      config: [{ subnet: "${SVT_NET:-10.231}.10.0/24" }]
   edge:
     internal: true
     ipam:
-      config: [{ subnet: 10.231.20.0/24 }]
+      config: [{ subnet: "${SVT_NET:-10.231}.20.0/24" }]
 
 volumes:
   pki:
@@ -36,7 +39,7 @@ services:
   pki:
     <<: *locked-down
     build: { context: .. }
-    image: softvpn:test
+    image: softvpn:test${SVT_ID:-}
     user: "65534:65534"
     network_mode: none
     volumes: [pki:/pki]
@@ -45,7 +48,7 @@ services:
 
   server:
     <<: *locked-down
-    image: softvpn:test
+    image: softvpn:test${SVT_ID:-}
     user: "65534:65534"
     depends_on:
       pki: { condition: service_completed_successfully }
@@ -56,23 +59,23 @@ services:
       - ./ccd:/etc/softvpn/ccd:ro
     tmpfs: ["/tmp:uid=65534,gid=65534"]
     networks:
-      wan: { ipv4_address: 10.231.10.100 }
-      edge: { ipv4_address: 10.231.20.100 }
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.100" }
+      edge: { ipv4_address: "${SVT_NET:-10.231}.20.100" }
 
   # Stand-in for the internet, reachable only from the server's network.
   web:
     <<: *locked-down
     build: ./tools
-    image: softvpn-test-tools
+    image: softvpn-test-tools${SVT_ID:-}
     user: "65534:65534"
     command: [web.sh]
     networks:
-      wan: { ipv4_address: 10.231.10.10 }
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.10" }
 
   client1:
     &client
     build: ./tools
-    image: softvpn-test-tools
+    image: softvpn-test-tools${SVT_ID:-}
     read_only: true
     cap_drop: [ALL]
     cap_add: [NET_ADMIN]
@@ -98,14 +101,14 @@ services:
   client3:
     <<: *client
     build: { context: ./tools, args: { ALPINE: "3.17" } }
-    image: softvpn-test-tools:openvpn-2.5
+    image: softvpn-test-tools${SVT_ID:-}:openvpn-2.5
     command: [client-entrypoint.sh, --config, /pki/client3.ovpn, --data-ciphers, CHACHA20-POLY1305]
 
   # On the same isolated network as the clients but without a VPN: shows that
   # nothing is reachable from "edge" except through the tunnel.
   probe:
     <<: *locked-down
-    image: softvpn-test-tools
+    image: softvpn-test-tools${SVT_ID:-}
     user: "65534:65534"
     command: [sleep, infinity]
     networks: [edge]

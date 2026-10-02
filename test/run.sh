@@ -3,8 +3,13 @@
 #
 #   test/run.sh          build, run every check, tear down
 #   KEEP=1 test/run.sh   leave the environment running afterwards
+#
+# Parallel runs (e.g. in several worktrees) must not share names or subnets:
+#   SVT_ID=-2 SVT_NET=10.232 test/run.sh
 set -uo pipefail
 cd "$(dirname "$0")"
+export SVT_ID=${SVT_ID:-} SVT_NET=${SVT_NET:-10.231}
+WEB=$SVT_NET.10.10 SRV_WAN=$SVT_NET.10.100
 
 dc() { docker compose "$@"; }
 pass=0 fail=0 warn=0
@@ -63,7 +68,7 @@ c1ip=$(tunip client1)
 case "$c1ip" in 10.8.0.*) ok "client1 (UDP) got $c1ip from the server's address pool" ;; *) bad "client1 (UDP) got a pool address on tun0" "tun0: $c1ip" ;; esac
 check "client2 (TCP) got static 10.8.0.20 from client-config-dir" sh -c "docker compose exec -T client2 ip -4 addr show tun0 | grep -q 'inet 10.8.0.20/24'"
 check "client1 pings the server's virtual address 10.8.0.1" x client1 ping -c 3 -W 2 10.8.0.1
-check "redirect-gateway: client1 routes web traffic via tun0" sh -c "docker compose exec -T client1 ip route get 10.231.10.10 | grep -q 'dev tun0'"
+check "redirect-gateway: client1 routes web traffic via tun0" sh -c "docker compose exec -T client1 ip route get $WEB | grep -q 'dev tun0'"
 
 srvlog() { dc logs --no-log-prefix server 2>/dev/null; }
 line=$(srvlog | grep 'client connected' | grep 'client=client1 ')
@@ -72,37 +77,37 @@ echo "$line" | grep -q 'version=2.6' && echo "$line" | grep -q 'key_derivation=t
 line=$(srvlog | grep 'client connected' | grep 'client=client3 ')
 echo "$line" | grep -q 'version=2.5' && echo "$line" | grep -q 'cipher=CHACHA20-POLY1305' && echo "$line" | grep -q 'key_derivation=openvpn-prf' &&
   ok "client3: OpenVPN $(echo "$line" | sed -n 's/.*version=\([^ ]*\).*/\1/p'), ChaCha20-Poly1305, legacy PRF keys" || bad "client3 negotiation (2.5 client, chacha, PRF)" "$line"
-out=$(x client3 curl -s -m 5 http://10.231.10.10/ 2>&1)
-echo "$out" | grep -q "you are 10.231.10.100" && ok "client3 (OpenVPN 2.5) -> web through NAT" || bad "client3 -> web" "$out"
+out=$(x client3 curl -s -m 5 http://$WEB/ 2>&1)
+echo "$out" | grep -q "you are $SRV_WAN" && ok "client3 (OpenVPN 2.5) -> web through NAT" || bad "client3 -> web" "$out"
 
 echo "==> isolation baseline (probe: same network as the clients, no VPN)"
-if x probe curl -s -m 3 http://10.231.10.10/ >/dev/null 2>&1; then
+if x probe curl -s -m 3 http://$WEB/ >/dev/null 2>&1; then
   bad "probe cannot reach web without VPN" "edge network is not isolated, test is meaningless"
 else
-  ok "probe cannot reach web (10.231.10.10) without the VPN"
+  ok "probe cannot reach web ($WEB) without the VPN"
 fi
 
 echo "==> software NAT out through the server"
-out=$(x client1 curl -s -m 5 http://10.231.10.10/ 2>&1)
-if echo "$out" | grep -q "hello from .*, you are 10.231.10.100"; then
+out=$(x client1 curl -s -m 5 http://$WEB/ 2>&1)
+if echo "$out" | grep -q "hello from .*, you are $SRV_WAN"; then
   ok "client1 -> web over UDP tunnel; web saw the server's address: ${out##*you are }"
 else
   bad "client1 -> web over UDP tunnel, NATed to server address" "$out"
 fi
-out=$(x client2 curl -s -m 5 http://10.231.10.10/ 2>&1)
-echo "$out" | grep -q "you are 10.231.10.100" && ok "client2 -> web over TCP tunnel, NATed" || bad "client2 -> web over TCP tunnel" "$out"
-out=$(x client1 sh -c 'echo udp-echo-test | socat -t 2 - UDP:10.231.10.10:7' 2>&1)
+out=$(x client2 curl -s -m 5 http://$WEB/ 2>&1)
+echo "$out" | grep -q "you are $SRV_WAN" && ok "client2 -> web over TCP tunnel, NATed" || bad "client2 -> web over TCP tunnel" "$out"
+out=$(x client1 sh -c "echo udp-echo-test | socat -t 2 - UDP:$WEB:7" 2>&1)
 [ "$out" = udp-echo-test ] && ok "UDP NAT: echo service answered" || bad "UDP NAT echo" "$out"
-check "ICMP NAT: client1 pings web (unprivileged ping socket on server)" x client1 ping -c 3 -W 2 10.231.10.10
+check "ICMP NAT: client1 pings web (unprivileged ping socket on server)" x client1 ping -c 3 -W 2 $WEB
 out=$(x client1 dig +short +time=2 +tries=2 @10.8.0.1 web 2>&1)
-[ "$out" = 10.231.10.10 ] && ok "DNS via 10.8.0.1 resolves names only the server knows (web -> $out)" || bad "DNS via VPN gateway" "$out"
+[ "$out" = $WEB ] && ok "DNS via 10.8.0.1 resolves names only the server knows (web -> $out)" || bad "DNS via VPN gateway" "$out"
 
 echo "==> client-to-client routing"
 out=$(x client1 curl -s -m 5 http://10.8.0.20:8080/ 2>&1)
 echo "$out" | grep -q "you are $c1ip\$" && ok "client1 -> client2 (10.8.0.20) directly over the VPN: $out" || bad "client-to-client" "$out"
 
 echo "==> throughput (informational)"
-if t=$(x client1 curl -s -m 60 -o /dev/null -w '%{size_download} %{speed_download}' http://10.231.10.10:81/ 2>&1); then
+if t=$(x client1 curl -s -m 60 -o /dev/null -w '%{size_download} %{speed_download}' http://$WEB:81/ 2>&1); then
   read -r size speed <<<"$t"
   if [ "$size" = 50000000 ]; then
     ok "50 MB download through tunnel + NAT, intact ($(awk "BEGIN{printf \"%.1f\", $speed*8/1e6}") Mbit/s)"
@@ -126,8 +131,8 @@ rekeys() { dc logs server 2>/dev/null | grep -c 'data channel rekeyed'; }
 for _ in $(seq 1 40); do [ "$(rekeys)" -ge 2 ] && break; sleep 1; done
 n=$(rekeys)
 if [ "$n" -ge 2 ] && dc logs client1 2>/dev/null | grep -q 'TLS: soft reset'; then
-  out=$(x client1 curl -s -m 5 http://10.231.10.10/ 2>&1)
-  echo "$out" | grep -q "you are 10.231.10.100" && ok "traffic still flows after $n client-initiated key renegotiations" || bad "traffic after renegotiation" "$out"
+  out=$(x client1 curl -s -m 5 http://$WEB/ 2>&1)
+  echo "$out" | grep -q "you are $SRV_WAN" && ok "traffic still flows after $n client-initiated key renegotiations" || bad "traffic after renegotiation" "$out"
 else
   bad "client1 renegotiated keys" "server saw $n rekeys"
 fi
