@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
@@ -17,10 +18,13 @@ import (
 
 // Directives understood by the server. They follow OpenVPN's server.conf.
 var directives = []string{
-	"port", "proto", "local", "dev", "server", "topology", "ca", "cert", "key",
+	"port", "proto", "local", "dev", "server", "server-ipv6", "topology", "ca", "cert", "key",
+	"route", "route-ipv6",
 	"client-to-client", "duplicate-cn", "keepalive", "push", "client-config-dir",
 	"max-clients", "data-ciphers", "ncp-ciphers", "tun-mtu", "status", "verb",
-	"cipher", "data-ciphers-fallback", "auth", "compress", "comp-lzo", "allow-compression",
+	"server-bridge", "dev-type", "lladdr",
+	"tls-auth", "tls-crypt", "tls-crypt-v2", "key-direction", "auth",
+	"cipher", "data-ciphers-fallback", "compress", "comp-lzo", "allow-compression",
 	// softvpn extensions
 	"upstream-dns", "nat-allow", "nat-deny",
 }
@@ -32,13 +36,14 @@ var ignored = []string{
 	"explicit-exit-notify", "ifconfig-pool-persist", "tls-server", "mode",
 	"tls-version-min", "remote-cert-tls", "mute",
 	"log", "log-append", "daemon", "script-security", "sndbuf", "rcvbuf",
-	"txqueuelen", "fast-io", "mssfix", "tun-mtu-extra", "dev-type",
+	"txqueuelen", "fast-io", "mssfix", "tun-mtu-extra",
 }
 
 // Listener is one transport the server accepts clients on.
 type Listener struct {
-	Proto string // "udp" or "tcp"
-	Addr  string
+	Proto   string // "udp" or "tcp"
+	Network string // Go network: "udp" (dual-stack), "udp4", "tcp" or "tcp4"
+	Addr    string
 }
 
 // Config is the parsed server configuration.
@@ -46,7 +51,11 @@ type Config struct {
 	Listeners      []Listener
 	Subnet         netip.Prefix
 	Gateway        netip.Addr
+	Subnet6        netip.Prefix // server-ipv6; invalid if IPv6 is off
+	Gateway6       netip.Addr
+	Routes         []netip.Prefix // route, route-ipv6: networks behind clients
 	TLS            *tls.Config
+	Wrap           *ovpn.ControlWrap // tls-auth / tls-crypt / tls-crypt-v2
 	Ciphers        []string
 	ClientToClient bool
 	DuplicateCN    bool
@@ -62,16 +71,29 @@ type Config struct {
 	StatusFile     string
 	StatusInterval time.Duration
 	Verb           int
+	Auth           AuthConfig
+
+	// TAP (bridged) mode: clients exchange Ethernet frames over a virtual
+	// switch; see bridge.go.
+	TAP       bool
+	PoolStart netip.Addr // server-bridge address range (else the whole subnet)
+	PoolEnd   netip.Addr
+	DHCP      bool // server-bridge without arguments: addresses only by DHCP
+	NoGateway bool // server-bridge nogw: no route-gateway, no DHCP router
+	MAC       net.HardwareAddr
 
 	CipherFallback   string // data-ciphers-fallback, for clients that cannot negotiate
-	Auth             string // HMAC digest for CBC ciphers
+	Digest           string // "auth": HMAC digest for CBC ciphers (and tls-auth)
 	Compress         ovpn.Compress
 	AllowCompression ovpn.AllowCompression
 }
 
 // Load validates directives and builds a server Config.
 func Load(c *config.Config) (*Config, error) {
-	if err := c.Check(append(directives, ignored...)...); err != nil {
+	if err := rejectScripts(c); err != nil {
+		return nil, err
+	}
+	if err := c.Check(append(append(directives, authDirectives...), ignored...)...); err != nil {
 		return nil, err
 	}
 	cfg := &Config{
@@ -94,22 +116,46 @@ func Load(c *config.Config) (*Config, error) {
 		protos = []config.Directive{{Name: "proto", Args: []string{"udp"}}}
 	}
 	for _, d := range protos {
+		// As in OpenVPN 2.4+, udp/tcp and udp6/tcp6 listen dual-stack: on
+		// IPv6 and IPv4 when the host has IPv6 (unless "local" names one
+		// address), otherwise on IPv4. udp4/tcp4 listen on IPv4 only.
+		name := strings.TrimSuffix(strings.ToLower(d.Arg(0)), "-server")
 		var p string
-		switch strings.ToLower(d.Arg(0)) {
-		case "udp", "udp4":
+		switch name {
+		case "udp", "udp4", "udp6":
 			p = "udp"
-		case "tcp", "tcp4", "tcp-server", "tcp4-server":
+		case "tcp", "tcp4", "tcp6":
 			p = "tcp"
 		default:
-			return nil, d.Errorf("unsupported protocol %q (use udp or tcp)", d.Arg(0))
+			return nil, d.Errorf("unsupported protocol %q (use udp, udp4, udp6, tcp, tcp4 or tcp6)", d.Arg(0))
 		}
-		cfg.Listeners = append(cfg.Listeners, Listener{Proto: p, Addr: net.JoinHostPort(local, port)})
+		network := strings.TrimSuffix(name, "6")
+		cfg.Listeners = append(cfg.Listeners, Listener{Proto: p, Network: network, Addr: net.JoinHostPort(local, port)})
 	}
 
-	if d, ok := c.Last("dev"); ok && !strings.HasPrefix(d.Arg(0), "tun") {
-		return nil, d.Errorf("only routed (tun) mode is supported")
+	// The device type comes from dev-type, or else the dev name (tun0, tap).
+	if d, ok := c.Last("dev"); ok {
+		switch {
+		case strings.HasPrefix(d.Arg(0), "tun"):
+		case strings.HasPrefix(d.Arg(0), "tap"):
+			cfg.TAP = true
+		default:
+			if !c.Has("dev-type") {
+				return nil, d.Errorf("cannot tell the device type of %q (use tun or tap, or set dev-type)", d.Arg(0))
+			}
+		}
 	}
-	if d, ok := c.Last("topology"); ok && d.Arg(0) != "subnet" {
+	if d, ok := c.Last("dev-type"); ok {
+		switch d.Arg(0) {
+		case "tun":
+			cfg.TAP = false
+		case "tap":
+			cfg.TAP = true
+		default:
+			return nil, d.Errorf("dev-type must be tun or tap")
+		}
+	}
+	if d, ok := c.Last("topology"); ok && d.Arg(0) != "subnet" && !cfg.TAP {
 		return nil, d.Errorf("only \"topology subnet\" is supported")
 	}
 
@@ -136,6 +182,48 @@ func Load(c *config.Config) (*Config, error) {
 	}
 	cfg.Subnet = p.Masked()
 	cfg.Gateway = cfg.Subnet.Addr().Next()
+	if err := cfg.loadBridge(c); err != nil {
+		return nil, err
+	}
+
+	// server-ipv6 fd00:8::/64: the gateway is ::1 and each client's address
+	// is derived from its IPv4 one, starting at ::1000 like OpenVPN's pool.
+	if d, ok := c.Last("server-ipv6"); ok {
+		p6, err := netip.ParsePrefix(d.Arg(0))
+		if err != nil || !p6.Addr().Is6() || p6.Addr().Is4In6() || p6.Bits() > 112 {
+			return nil, d.Errorf("expects an IPv6 PREFIX/LEN of /112 or larger")
+		}
+		if host := 128 - p6.Bits(); host < 64 && 0x1000+uint64(1)<<(32-cfg.Subnet.Bits()) > uint64(1)<<host {
+			return nil, d.Errorf("%s is too small for the IPv4 subnet %s", p6, cfg.Subnet)
+		}
+		cfg.Subnet6 = p6.Masked()
+		cfg.Gateway6 = cfg.Subnet6.Addr().Next()
+	}
+
+	// route NETWORK [NETMASK [GATEWAY [METRIC]]] and route-ipv6 PREFIX
+	// [GATEWAY [METRIC]]. Kernel OpenVPN installs a kernel route; here they
+	// just mark the network as inside the VPN, so it is reached through
+	// whichever client has it as an iroute, and never NATed out.
+	for _, d := range c.All("route") {
+		if len(d.Args) < 1 {
+			return nil, d.Errorf("expects NETWORK [NETMASK]")
+		}
+		pfx, err := parseRoute4(d.Args[0], d.Arg(1))
+		if err != nil {
+			return nil, d.Errorf("%v", err)
+		}
+		cfg.Routes = append(cfg.Routes, pfx)
+	}
+	for _, d := range c.All("route-ipv6") {
+		pfx, err := parseRoute6(d.Arg(0))
+		if err != nil {
+			return nil, d.Errorf("%v", err)
+		}
+		cfg.Routes = append(cfg.Routes, pfx)
+	}
+	if cfg.TAP && (cfg.Subnet6.IsValid() || len(cfg.Routes) > 0) {
+		return nil, fmt.Errorf("server-ipv6, route and route-ipv6 are not supported with dev tap")
+	}
 
 	if cfg.MTU, err = c.Int("tun-mtu", 1500); err != nil {
 		return nil, err
@@ -188,12 +276,12 @@ func Load(c *config.Config) (*Config, error) {
 			}
 		}
 	}
-	cfg.Auth = "SHA1"
+	cfg.Digest = "SHA1"
 	if d, ok := c.Last("auth"); ok {
-		if !ovpn.DigestSupported(d.Arg(0)) {
-			return nil, d.Errorf("unsupported digest %q (supported: %s)", d.Arg(0), strings.Join(ovpn.Digests, ", "))
+		if _, err := ovpn.DigestFunc(d.Arg(0)); err != nil {
+			return nil, d.Errorf("%v", err)
 		}
-		cfg.Auth = strings.ToUpper(d.Arg(0))
+		cfg.Digest = strings.ToUpper(strings.ReplaceAll(d.Arg(0), "-", ""))
 	}
 	if d, ok := c.Last("allow-compression"); ok {
 		if cfg.AllowCompression, err = ovpn.ParseAllowCompression(d.Arg(0)); err != nil {
@@ -259,6 +347,12 @@ func Load(c *config.Config) (*Config, error) {
 	if cfg.TLS, err = pki.ServerTLS(ca, cert, key); err != nil {
 		return nil, err
 	}
+	if cfg.Auth, err = loadAuth(c, ca, cfg.TLS); err != nil {
+		return nil, err
+	}
+	if cfg.Wrap, err = controlWrap(c); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -295,6 +389,76 @@ func (cfg *Config) compression(c *config.Config) (ovpn.Compress, error) {
 		mode = m
 	}
 	return mode, nil
+}
+
+// parseRoute4 parses an IPv4 route as OpenVPN writes it, NETWORK [NETMASK]
+// (a missing netmask means a host route), or as NETWORK/BITS.
+func parseRoute4(network, netmask string) (netip.Prefix, error) {
+	var p netip.Prefix
+	if strings.Contains(network, "/") {
+		var err error
+		if p, err = netip.ParsePrefix(network); err != nil {
+			return p, fmt.Errorf("invalid IPv4 route %q", network)
+		}
+	} else {
+		if netmask == "" {
+			netmask = "255.255.255.255"
+		}
+		ip, err := netip.ParseAddr(network)
+		ones, bits := net.IPMask(net.ParseIP(netmask).To4()).Size()
+		if err != nil || bits != 32 {
+			return p, fmt.Errorf("invalid IPv4 route %q %q", network, netmask)
+		}
+		p = netip.PrefixFrom(ip, ones)
+	}
+	if !p.Addr().Is4() {
+		return p, fmt.Errorf("invalid IPv4 route %q", network)
+	}
+	if p.Masked() != p {
+		return p, fmt.Errorf("%s has host bits set (network is %s)", p, p.Masked())
+	}
+	return p, nil
+}
+
+// parseRoute6 parses an IPv6 route, PREFIX/BITS.
+func parseRoute6(s string) (netip.Prefix, error) {
+	p, err := netip.ParsePrefix(s)
+	if err != nil || !p.Addr().Is6() || p.Addr().Is4In6() {
+		return p, fmt.Errorf("invalid IPv6 route %q (expects PREFIX/BITS)", s)
+	}
+	if p.Masked() != p {
+		return p, fmt.Errorf("%s has host bits set (network is %s)", p, p.Masked())
+	}
+	return p, nil
+}
+
+// internal reports whether a belongs inside the VPN: the client subnets and
+// the networks declared with route/route-ipv6. Such addresses are routed to
+// clients or dropped, never NATed out.
+func (cfg *Config) internal(a netip.Addr) bool {
+	if cfg.Subnet.Contains(a) || cfg.Subnet6.Contains(a) {
+		return true
+	}
+	for _, p := range cfg.Routes {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// ipv6For derives a client's IPv6 address from its IPv4 one: the first
+// pool address (gateway+1) maps to PREFIX::1000, the next to ::1001, and so
+// on, matching OpenVPN's ifconfig-ipv6-pool numbering.
+func (cfg *Config) ipv6For(ip netip.Addr) netip.Prefix {
+	if !cfg.Subnet6.IsValid() {
+		return netip.Prefix{}
+	}
+	a4, n4 := ip.As4(), cfg.Subnet.Addr().As4()
+	off := uint64(binary.BigEndian.Uint32(a4[:]) - binary.BigEndian.Uint32(n4[:]) - 2)
+	b := cfg.Subnet6.Addr().As16()
+	binary.BigEndian.PutUint64(b[8:], binary.BigEndian.Uint64(b[8:])+0x1000+off)
+	return netip.PrefixFrom(netip.AddrFrom16(b), cfg.Subnet6.Bits())
 }
 
 func parsePrefix(s string) (netip.Prefix, error) {
@@ -340,6 +504,8 @@ func withPort(addr, port string) string {
 // clientConfig is the per-client override file in client-config-dir.
 type clientConfig struct {
 	IP       netip.Addr
+	IP6      netip.Prefix // ifconfig-ipv6-push ADDR/BITS
+	IRoutes  []netip.Prefix
 	Push     []string
 	NoPush   bool // push-reset
 	Disabled bool
@@ -359,7 +525,8 @@ func (cfg *Config) loadCCD(cn string) (*clientConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := c.Check("ifconfig-push", "push", "push-reset", "disable", "iroute", "compress", "comp-lzo"); err != nil {
+	if err := c.Check("ifconfig-push", "ifconfig-ipv6-push", "push", "push-reset", "disable", "iroute", "iroute-ipv6",
+		"compress", "comp-lzo"); err != nil {
 		return nil, err
 	}
 	if cc.Compress, err = cfg.compression(c); err != nil {
@@ -377,8 +544,41 @@ func (cfg *Config) loadCCD(cn string) (*clientConfig, error) {
 		}
 		cc.IP = ip
 	}
-	if len(c.All("iroute")) > 0 {
-		return nil, fmt.Errorf("%s: iroute is not supported", path)
+	// ifconfig-ipv6-push ADDR/BITS [REMOTE]: the remote end is always the
+	// server's gateway, so a second argument is accepted and ignored.
+	if d, ok := c.Last("ifconfig-ipv6-push"); ok {
+		if !cfg.Subnet6.IsValid() {
+			return nil, d.Errorf("needs server-ipv6 in the server configuration")
+		}
+		p, err := netip.ParsePrefix(d.Arg(0))
+		if err != nil || !cfg.Subnet6.Contains(p.Addr()) || p.Addr() == cfg.Gateway6 || p.Addr() == cfg.Subnet6.Addr() {
+			return nil, d.Errorf("%q is not a usable ADDRESS/BITS in %s", d.Arg(0), cfg.Subnet6)
+		}
+		cc.IP6 = p
+	}
+	// iroute NETWORK [NETMASK] and iroute-ipv6 PREFIX: networks behind this
+	// client, routed to it.
+	for _, d := range c.All("iroute") {
+		p, err := parseRoute4(d.Arg(0), d.Arg(1))
+		if err != nil {
+			return nil, d.Errorf("%v", err)
+		}
+		cc.IRoutes = append(cc.IRoutes, p)
+	}
+	for _, d := range c.All("iroute-ipv6") {
+		p, err := parseRoute6(d.Arg(0))
+		if err != nil {
+			return nil, d.Errorf("%v", err)
+		}
+		cc.IRoutes = append(cc.IRoutes, p)
+	}
+	if len(cc.IRoutes) > 0 && cfg.TAP {
+		return nil, fmt.Errorf("%s: iroute is not supported with dev tap", path)
+	}
+	for _, p := range cc.IRoutes {
+		if p.Overlaps(cfg.Subnet) || p.Overlaps(cfg.Subnet6) {
+			return nil, fmt.Errorf("%s: iroute %s overlaps the VPN subnet", path, p)
+		}
 	}
 	return cc, nil
 }

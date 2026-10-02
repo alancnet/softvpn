@@ -1,0 +1,4 @@
+# A site gateway: the networks behind this client are routed to it.
+# (Written for the default SVT_NET/SVT_NET6; run.sh rewrites the subnets.)
+iroute 10.231.50.0 255.255.255.0
+iroute-ipv6 fd00:231:50::/64

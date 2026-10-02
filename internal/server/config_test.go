@@ -27,12 +27,12 @@ func loadConf(t *testing.T, extra string) (*Config, error) {
 
 func TestLoadCiphers(t *testing.T) {
 	cfg, err := loadConf(t, "")
-	if err != nil || cfg.Auth != "SHA1" || cfg.CipherFallback != "" || cfg.Compress != ovpn.CompressUnset {
+	if err != nil || cfg.Digest != "SHA1" || cfg.CipherFallback != "" || cfg.Compress != ovpn.CompressUnset {
 		t.Fatalf("defaults: %+v %v", cfg, err)
 	}
 	// "cipher" not in data-ciphers becomes the fallback (OpenVPN 2.6).
 	cfg, err = loadConf(t, "data-ciphers AES-256-GCM:aes-256-cbc\ncipher BF-CBC\nauth sha256\n")
-	if err != nil || cfg.CipherFallback != "BF-CBC" || cfg.Auth != "SHA256" || cfg.Ciphers[1] != "AES-256-CBC" {
+	if err != nil || cfg.CipherFallback != "BF-CBC" || cfg.Digest != "SHA256" || cfg.Ciphers[1] != "AES-256-CBC" {
 		t.Fatalf("got %+v %v", cfg, err)
 	}
 	cfg, err = loadConf(t, "data-ciphers AES-256-GCM:AES-256-CBC\ncipher AES-256-CBC\n")

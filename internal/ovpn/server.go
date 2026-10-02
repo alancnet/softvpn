@@ -22,9 +22,10 @@ type Options struct {
 	PushPing        time.Duration // pushed "ping"
 	PushPingRestart time.Duration // pushed "ping-restart"
 	HandshakeWindow time.Duration
+	Wrap            *ControlWrap // tls-auth / tls-crypt / tls-crypt-v2; nil for none
 
 	CipherFallback   string // data-ciphers-fallback, for clients that cannot negotiate
-	Auth             string // HMAC digest for CBC ciphers ("auth"), default SHA1
+	Digest           string // "auth": HMAC digest for CBC ciphers, default SHA1
 	AllowCompression AllowCompression
 }
 
@@ -44,8 +45,8 @@ func NewServer(opt Options, h Handler, log *slog.Logger) *Server {
 	if len(opt.Ciphers) == 0 {
 		opt.Ciphers = SupportedCiphers
 	}
-	if opt.Auth == "" {
-		opt.Auth = "SHA1"
+	if opt.Digest == "" {
+		opt.Digest = "SHA1"
 	}
 	if opt.HandshakeWindow == 0 {
 		opt.HandshakeWindow = 60 * time.Second
@@ -53,7 +54,7 @@ func NewServer(opt Options, h Handler, log *slog.Logger) *Server {
 	return &Server{opt: opt, h: h, log: log, byPeerID: map[uint32]*Session{}, byAddr: map[netip.AddrPort]*Session{}}
 }
 
-func (srv *Server) register(tr transport, sid sessionID, addr netip.AddrPort) *Session {
+func (srv *Server) register(tr transport, sid sessionID, addr netip.AddrPort, wrap *tlsWrap) *Session {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	// Peer ids are 24 bits; 0xFFFFFF is reserved ("undefined").
@@ -63,7 +64,7 @@ func (srv *Server) register(tr transport, sid sessionID, addr netip.AddrPort) *S
 			break
 		}
 	}
-	s := newSession(srv, tr, sid, srv.nextPeer)
+	s := newSession(srv, tr, sid, srv.nextPeer, wrap)
 	srv.byPeerID[s.peerID] = s
 	if addr.IsValid() {
 		srv.byAddr[addr] = s
@@ -84,7 +85,33 @@ func (srv *Server) forget(s *Session) {
 	}
 }
 
-func isHardReset(b []byte) bool { return len(b) > 0 && opcodeOf(b[0]) == opControlHardResetClientV2 }
+func isHardReset(b []byte) bool {
+	return len(b) > 0 && (opcodeOf(b[0]) == opControlHardResetClientV2 || opcodeOf(b[0]) == opControlHardResetClientV3)
+}
+
+// wireSID is the sender's session id, which sits right after the opcode
+// whatever the control-channel protection.
+func wireSID(b []byte) (sid sessionID, ok bool) {
+	if len(b) < 9 {
+		return sid, false
+	}
+	copy(sid[:], b[1:9])
+	return sid, true
+}
+
+// acceptReset verifies a new client's hard reset (tls-auth etc.) and parses
+// it. It returns the session's wrap state and the plain packet.
+func (srv *Server) acceptReset(b []byte) (*tlsWrap, *controlPacket, []byte, error) {
+	w, plain, err := acceptReset(srv.opt.Wrap, b)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	p, err := parseControl(plain)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return w, p, plain, nil
+}
 
 // ---- UDP ----
 
@@ -142,20 +169,25 @@ func (srv *Server) inputUDP(conn *net.UDPConn, addr netip.AddrPort, pkt []byte) 
 	srv.mu.Unlock()
 
 	if isHardReset(pkt) {
-		p, err := parseControl(pkt)
-		if err != nil {
+		sid, ok := wireSID(pkt)
+		if !ok {
 			return
 		}
-		if s != nil && s.remoteSID == p.sid {
+		if s != nil && s.remoteSID == sid {
 			s.input(pkt) // retransmitted reset
+			return
+		}
+		w, p, plain, err := srv.acceptReset(pkt)
+		if err != nil {
+			srv.log.Debug("dropping hard reset", "remote", addr, "err", err)
 			return
 		}
 		if s != nil {
 			s.Close("client restarted")
 		}
-		s = srv.register(&udpTransport{conn: conn, peer: addr}, p.sid, addr)
+		s = srv.register(&udpTransport{conn: conn, peer: addr}, p.sid, addr, w)
 		s.log.Debug("new session")
-		s.input(pkt)
+		s.inputControl(plain)
 		return
 	}
 
@@ -259,14 +291,15 @@ func (srv *Server) serveTCPConn(ctx context.Context, c net.Conn) {
 		srv.log.Debug("tcp: expected hard reset", "remote", c.RemoteAddr(), "err", err)
 		return
 	}
-	p, err := parseControl(first)
+	w, p, plain, err := srv.acceptReset(first)
 	if err != nil {
+		srv.log.Debug("tcp: dropping hard reset", "remote", c.RemoteAddr(), "err", err)
 		return
 	}
 	c.SetReadDeadline(time.Time{})
-	s := srv.register(&tcpTransport{conn: c}, p.sid, netip.AddrPort{})
+	s := srv.register(&tcpTransport{conn: c}, p.sid, netip.AddrPort{}, w)
 	s.log.Debug("new session")
-	s.input(first)
+	s.inputControl(plain)
 	for {
 		pkt, err := read()
 		if err != nil {

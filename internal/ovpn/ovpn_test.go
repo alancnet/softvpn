@@ -7,6 +7,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/binary"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -295,7 +296,7 @@ func TestCBCFormat(t *testing.T) {
 	if binary.BigEndian.Uint32(pt) != 1 || !bytes.Equal(pt[4:36], payload) || pt[47] != 12 {
 		t.Fatalf("plaintext layout %x", pt)
 	}
-	for _, name := range Digests {
+	for name := range Digests {
 		if _, err := newDataKeys("BF-CBC", name, block); err != nil {
 			t.Fatal(name, err)
 		}
@@ -329,5 +330,22 @@ func TestSetCompression(t *testing.T) {
 		if s.comp.mode != c.mode || s.compPush != c.push || s.comp.allow != AllowCompressionYes {
 			t.Errorf("%s: got %v %q", c.name, s.comp.mode, s.compPush)
 		}
+	}
+}
+
+func TestPushReplyIPv6(t *testing.T) {
+	s := &Session{srv: &Server{opt: Options{PushPing: 10 * time.Second, PushPingRestart: 60 * time.Second}}, cipher: "AES-256-GCM", pi: peerInfo{}}
+	a := &Assignment{
+		IP: netip.MustParseAddr("10.8.0.2"), Netmask: "255.255.255.0", Gateway: netip.MustParseAddr("10.8.0.1"),
+		IP6: netip.MustParsePrefix("fd00:8::1000/64"), Gateway6: netip.MustParseAddr("fd00:8::1"),
+	}
+	msgs := s.pushReply(a)
+	if len(msgs) != 1 || !strings.Contains(msgs[0], ",ifconfig-ipv6 fd00:8::1000/64 fd00:8::1,") ||
+		!strings.Contains(msgs[0], ",ifconfig 10.8.0.2 255.255.255.0") {
+		t.Fatalf("push reply: %q", msgs)
+	}
+	a.IP6 = netip.Prefix{}
+	if msgs := s.pushReply(a); strings.Contains(msgs[0], "ifconfig-ipv6") {
+		t.Fatalf("ifconfig-ipv6 pushed without an IPv6 address: %q", msgs)
 	}
 }

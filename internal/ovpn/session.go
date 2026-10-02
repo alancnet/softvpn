@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"strings"
 	"sync"
@@ -17,10 +19,17 @@ import (
 // Assignment is what the application decides for a newly authenticated
 // client: its address and any extra options to push.
 type Assignment struct {
-	IP      netip.Addr
-	Netmask string // dotted quad, for "ifconfig"
-	Gateway netip.Addr
-	Push    []string
+	IP       netip.Addr
+	Netmask  string // dotted quad, for "ifconfig"
+	Gateway  netip.Addr
+	IP6      netip.Prefix // address/bits for "ifconfig-ipv6"; optional
+	Gateway6 netip.Addr
+	Push     []string
+	// TAP: the client is bridged (dev tap), so no "topology" is pushed.
+	// DHCP: the client gets its address by DHCP over the bridge instead of
+	// a pushed "ifconfig", and learns the gateway the same way. An invalid
+	// Gateway pushes no route-gateway at all.
+	TAP, DHCP bool
 	// Compress is the client's compression framing ("compress"/"comp-lzo"
 	// from server.conf or client-config-dir); it is pushed to the client.
 	Compress Compress
@@ -35,6 +44,24 @@ type Handler interface {
 	Packet(s *Session, pkt []byte)
 	// Disconnect is called once for every session Connect accepted.
 	Disconnect(s *Session, reason string)
+}
+
+// Credentials are what a client presented in one key exchange.
+type Credentials struct {
+	Certificate   *x509.Certificate // nil if the client sent none
+	Username      string            // from auth-user-pass; empty if not sent
+	Password      string
+	Renegotiation bool // false for the session's first key exchange
+}
+
+// Authenticator is an optional Handler extension that checks credentials.
+// Authenticate is called for every key exchange, the first (before Connect)
+// and each renegotiation, and returns the common name the session is known
+// by. An error is sent to the client as AUTH_FAILED and ends the session.
+// Handlers without it accept any client whose certificate passed TLS
+// verification, under the certificate's CN.
+type Authenticator interface {
+	Authenticate(s *Session, c *Credentials) (commonName string, err error)
 }
 
 // transport sends wire packets to one client.
@@ -55,10 +82,14 @@ type Session struct {
 	remoteSID sessionID
 	peerID    uint32
 	created   time.Time
+	wrap      *tlsWrap   // tls-auth / tls-crypt state; nil without
+	sendMu    sync.Mutex // keeps wrapped control packets in packet-id order
 
 	mu     sync.Mutex
 	keys   [8]*keyState
 	cn     string
+	user   string
+	cert   *x509.Certificate
 	pi     peerInfo
 	cipher string
 	useEKM bool
@@ -86,15 +117,17 @@ type keyState struct {
 	id   byte
 	rel  *reliable
 	pipe *pipe
+	conn atomic.Pointer[tls.Conn] // once the handshake is done
 	data atomic.Pointer[dataKeys]
 }
 
-func newSession(srv *Server, tr transport, remoteSID sessionID, peerID uint32) *Session {
+func newSession(srv *Server, tr transport, remoteSID sessionID, peerID uint32, wrap *tlsWrap) *Session {
 	s := &Session{
 		srv:       srv,
 		tr:        tr,
 		remoteSID: remoteSID,
 		peerID:    peerID,
+		wrap:      wrap,
 		created:   time.Now(),
 		done:      make(chan struct{}),
 	}
@@ -106,8 +139,21 @@ func newSession(srv *Server, tr transport, remoteSID sessionID, peerID uint32) *
 	return s
 }
 
-// CommonName is the client certificate's CN.
+// CommonName is the client certificate's CN, or what the Authenticator
+// chose (the username, with username-as-common-name).
 func (s *Session) CommonName() string { return s.cn }
+
+// Username is the auth-user-pass username the session authenticated with,
+// or "" for certificate-only clients.
+func (s *Session) Username() string { return s.user }
+
+// Certificate is the client certificate from the latest key exchange, or
+// nil if the client did not send one.
+func (s *Session) Certificate() *x509.Certificate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cert
+}
 
 // PeerInfo returns an IV_* value the client sent (e.g. "IV_VER").
 func (s *Session) PeerInfo(key string) string { return s.pi[key] }
@@ -136,6 +182,18 @@ func (s *Session) Close(reason string) {
 	})
 }
 
+// Kick tells the client why it is being disconnected, then ends the
+// session. msg is an OpenVPN control message: "AUTH_FAILED,reason" makes a
+// stock client stop; "RESTART" makes it reconnect.
+func (s *Session) Kick(msg, reason string) {
+	if ks := s.primary.Load(); ks != nil {
+		if conn := ks.conn.Load(); conn != nil {
+			conn.Write([]byte(msg + "\x00"))
+		}
+	}
+	time.AfterFunc(2*time.Second, func() { s.Close(reason) })
+}
+
 // newKeyState must be called with s.mu held (or before the session is shared).
 func (s *Session) newKeyState(id byte, initialOp byte) *keyState {
 	ks := &keyState{id: id, rel: newReliable(id, !s.tr.reliable())}
@@ -153,11 +211,19 @@ func (s *Session) newKeyState(id byte, initialOp byte) *keyState {
 }
 
 func (s *Session) sendAll(pkts [][]byte) {
+	var err error
+	s.sendMu.Lock()
 	for _, p := range pkts {
-		if err := s.tr.send(p); err != nil {
-			s.Close(fmt.Sprintf("send: %v", err))
-			return
+		if s.wrap != nil {
+			p = s.wrap.wrap(p)
 		}
+		if err = s.tr.send(p); err != nil {
+			break
+		}
+	}
+	s.sendMu.Unlock()
+	if err != nil {
+		s.Close(fmt.Sprintf("send: %v", err))
 	}
 }
 
@@ -166,10 +232,20 @@ func (s *Session) input(b []byte) {
 	if len(b) < 1 {
 		return
 	}
-	switch op := opcodeOf(b[0]); op {
-	case opDataV1, opDataV2:
+	switch op := opcodeOf(b[0]); {
+	case op == opDataV1 || op == opDataV2:
 		s.inputData(op, b)
-	case opControlHardResetClientV2, opControlSoftResetV1, opControlV1, opAckV1:
+	case isControl(op):
+		if s.wrap != nil {
+			var err error
+			if b, err = s.wrap.unwrapInput(b); err != nil {
+				s.log.Debug("dropping control packet", "mode", s.wrap.mode, "err", err)
+				return
+			}
+		} else if hasWKc(op) {
+			s.log.Debug("ignoring tls-crypt-v2 packet: server has no tls-crypt-v2 key", "opcode", op)
+			return
+		}
 		s.inputControl(b)
 	default:
 		s.log.Debug("ignoring packet with unsupported opcode", "opcode", op)
@@ -289,11 +365,20 @@ func (s *Session) runKey(ks *keyState) {
 		}
 	}
 	if err := conn.HandshakeContext(ctx); err != nil {
+		if ks.id != 0 && ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+			// e.g. the certificate has been revoked since the session began
+			s.Close(fmt.Sprintf("renegotiation TLS handshake failed: %v", err))
+			return
+		}
 		fail("TLS handshake failed", err)
 		return
 	}
+	ks.conn.Store(conn)
 	cs := conn.ConnectionState()
-	cn := cs.PeerCertificates[0].Subject.CommonName
+	var cert *x509.Certificate
+	if len(cs.PeerCertificates) > 0 {
+		cert = cs.PeerCertificates[0]
+	}
 
 	// Key method 2: OpenVPN writes it in one TLS record, so it normally
 	// arrives in a single read.
@@ -316,28 +401,22 @@ func (s *Session) runKey(ks *keyState) {
 	}
 
 	s.mu.Lock()
-	first := ks.id == 0 && s.cn == ""
+	first := ks.id == 0
 	if first {
-		s.cn = cn
 		s.pi = parsePeerInfo(km.peerInfo)
-		s.log = s.log.With("client", cn)
 		s.log.Debug("key exchange", "options", km.options, "peer_info", strings.ReplaceAll(km.peerInfo, "\n", " "))
 		s.useEKM = s.pi.protoFlags()&ivProtoTLSKeyExport != 0
 		s.useV2.Store(s.pi.protoFlags()&ivProtoDataV2 != 0)
 		occCipher, _ := occOption(km.options, "cipher")
 		s.cipher, s.pushCipher = negotiateCipher(s.srv.opt.Ciphers, s.pi, occCipher, s.srv.opt.CipherFallback)
 		_, s.clientComp = occOption(km.options, "comp-lzo")
-		if auth, _ := occOption(km.options, "auth"); isCBC(s.cipher) && auth != "" && !strings.EqualFold(auth, s.srv.opt.Auth) {
+		if auth, _ := occOption(km.options, "auth"); isCBC(s.cipher) && auth != "" && !strings.EqualFold(auth, s.srv.opt.Digest) {
 			s.log.Warn("client uses a different auth digest; its data packets will fail authentication",
-				"client_auth", auth, "server_auth", s.srv.opt.Auth)
+				"client_auth", auth, "server_auth", s.srv.opt.Digest)
 		}
 	}
-	sameCN, cipherName, useEKM := s.cn == cn, s.cipher, s.useEKM
+	cipherName, useEKM := s.cipher, s.useEKM
 	s.mu.Unlock()
-	if !sameCN {
-		s.Close("client certificate changed during renegotiation")
-		return
-	}
 
 	sRand1, sRand2 := randomBytes(32), randomBytes(32)
 	var block []byte
@@ -356,11 +435,31 @@ func (s *Session) runKey(ks *keyState) {
 		return
 	}
 
+	if first && cipherName == "" {
+		s.authFailed(conn, "no common data-channel cipher (server offers "+strings.Join(s.srv.opt.Ciphers, ":")+")")
+		return
+	}
+	cn, err := s.authenticate(&Credentials{Certificate: cert, Username: km.username, Password: km.password, Renegotiation: !first})
+	if err != nil {
+		s.authFailed(conn, err.Error())
+		return
+	}
+	s.mu.Lock()
+	sameCN := first || s.cn == cn
 	if first {
-		if cipherName == "" {
-			s.authFailed(conn, "no common data-channel cipher (server offers "+strings.Join(s.srv.opt.Ciphers, ":")+")")
-			return
-		}
+		s.cn, s.user = cn, km.username
+		s.log = s.log.With("client", cn)
+	}
+	if sameCN {
+		s.cert = cert
+	}
+	s.mu.Unlock()
+	if !sameCN {
+		s.Close("client identity changed during renegotiation")
+		return
+	}
+
+	if first {
 		a, err := s.srv.h.Connect(s)
 		if err != nil {
 			s.authFailed(conn, err.Error())
@@ -376,7 +475,7 @@ func (s *Session) runKey(ks *keyState) {
 		s.connected.Store(true)
 	}
 
-	dk, err := newDataKeys(cipherName, s.srv.opt.Auth, block)
+	dk, err := newDataKeys(cipherName, s.srv.opt.Digest, block)
 	if err != nil {
 		fail("data channel keys", err)
 		return
@@ -392,6 +491,17 @@ func (s *Session) runKey(ks *keyState) {
 	}
 
 	s.readControlMessages(conn)
+}
+
+// authenticate checks a key exchange's credentials with the handler.
+func (s *Session) authenticate(c *Credentials) (string, error) {
+	if a, ok := s.srv.h.(Authenticator); ok {
+		return a.Authenticate(s, c)
+	}
+	if c.Certificate == nil {
+		return "", errors.New("client certificate required")
+	}
+	return c.Certificate.Subject.CommonName, nil
 }
 
 // retire drops a superseded key after OpenVPN's default transition window,
@@ -455,10 +565,14 @@ func (s *Session) controlMessage(conn *tls.Conn, msg string) {
 			if s.useEKM {
 				kdf = "tls-ekm"
 			}
-			attrs := []any{"ip", a.IP, "cipher", s.cipher, "key_derivation", kdf,
-				"version", s.pi["IV_VER"], "platform", s.pi["IV_PLAT"]}
+			attrs := []any{"ip", a.IP}
+			if a.IP6.IsValid() {
+				attrs = append(attrs, "ip6", a.IP6.Addr())
+			}
+			attrs = append(attrs, "cipher", s.cipher, "key_derivation", kdf,
+				"version", s.pi["IV_VER"], "platform", s.pi["IV_PLAT"])
 			if isCBC(s.cipher) {
-				attrs = append(attrs, "auth", s.srv.opt.Auth)
+				attrs = append(attrs, "auth", s.srv.opt.Digest)
 			}
 			if s.comp.mode != CompressUnset {
 				attrs = append(attrs, "compress", s.comp.mode)
@@ -477,13 +591,26 @@ func (s *Session) controlMessage(conn *tls.Conn, msg string) {
 func (s *Session) pushReply(a *Assignment) []string {
 	opt := s.srv.opt
 	opts := append([]string(nil), a.Push...)
+	switch {
+	case !a.Gateway.IsValid():
+	case a.DHCP:
+		opts = append(opts, "route-gateway dhcp")
+	default:
+		opts = append(opts, "route-gateway "+a.Gateway.String())
+	}
+	if !a.TAP {
+		opts = append(opts, "topology subnet")
+	}
 	opts = append(opts,
-		"route-gateway "+a.Gateway.String(),
-		"topology subnet",
 		fmt.Sprintf("ping %d", int(opt.PushPing/time.Second)),
 		fmt.Sprintf("ping-restart %d", int(opt.PushPingRestart/time.Second)),
-		"ifconfig "+a.IP.String()+" "+a.Netmask,
 	)
+	if a.IP6.IsValid() {
+		opts = append(opts, "ifconfig-ipv6 "+a.IP6.String()+" "+a.Gateway6.String())
+	}
+	if !a.DHCP {
+		opts = append(opts, "ifconfig "+a.IP.String()+" "+a.Netmask)
+	}
 	if s.useV2.Load() {
 		opts = append(opts, fmt.Sprintf("peer-id %d", s.peerID))
 	}

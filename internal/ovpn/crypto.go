@@ -7,8 +7,6 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
-	"crypto/sha256"
-	"crypto/sha512"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,17 +28,11 @@ var SupportedCiphers = []string{"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305
 // configured in data-ciphers, data-ciphers-fallback or cipher.
 var CBCCiphers = []string{"AES-256-CBC", "AES-192-CBC", "AES-128-CBC", "BF-CBC"}
 
-// Digests are the HMAC digests accepted for "auth".
-var Digests = []string{"SHA1", "SHA224", "SHA256", "SHA384", "SHA512"}
-
 // CipherSupported reports whether name is a data-channel cipher softvpn
 // implements, AEAD or CBC.
 func CipherSupported(name string) bool {
 	return inList(name, SupportedCiphers) || inList(name, CBCCiphers)
 }
-
-// DigestSupported reports whether name is a valid "auth" digest.
-func DigestSupported(name string) bool { return newDigest(name) != nil }
 
 func inList(name string, list []string) bool {
 	for _, c := range list {
@@ -87,22 +79,6 @@ func newBlock(name string, key []byte) (cipher.Block, error) {
 	return nil, fmt.Errorf("unsupported cipher %q", name)
 }
 
-func newDigest(name string) func() hash.Hash {
-	switch strings.ToUpper(name) {
-	case "SHA1":
-		return sha1.New
-	case "SHA224":
-		return sha256.New224
-	case "SHA256":
-		return sha256.New
-	case "SHA384":
-		return sha512.New384
-	case "SHA512":
-		return sha512.New
-	}
-	return nil
-}
-
 const (
 	keySize      = 128 // one direction: 64 bytes cipher key + 64 bytes HMAC key
 	keyBlockSize = 2 * keySize
@@ -140,8 +116,8 @@ func newDataKeys(cipherName, auth string, block []byte) (*dataKeys, error) {
 	d := &dataKeys{}
 	var err error
 	if isCBC(cipherName) {
-		if d.digest = newDigest(auth); d.digest == nil {
-			return nil, fmt.Errorf("unsupported auth digest %q", auth)
+		if d.digest, err = DigestFunc(auth); err != nil {
+			return nil, err
 		}
 		if d.recvBlock, err = newBlock(cipherName, c2s[:64]); err != nil {
 			return nil, err

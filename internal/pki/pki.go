@@ -182,8 +182,8 @@ func ServerTLS(caPEM, certPEM, keyPEM []byte) (*tls.Config, error) {
 	}, nil
 }
 
-// Dir is an on-disk PKI layout: ca.crt, ca.key, NAME.crt, NAME.key and
-// NAME.ovpn client profiles.
+// Dir is an on-disk PKI layout: ca.crt, ca.key, NAME.crt, NAME.key,
+// NAME.ovpn client profiles, crl.pem and revoked/.
 type Dir struct {
 	Path string
 	// Shared makes private keys and profiles readable by every user. Only
@@ -229,7 +229,10 @@ func (d Dir) Init(serverName string, sans []string, validity time.Duration) erro
 	if err := d.write("ca.key", caKey, 0o600); err != nil {
 		return err
 	}
-	return d.issue(ca, serverName, RoleServer, sans, validity)
+	if err := d.issue(ca, serverName, RoleServer, sans, validity); err != nil {
+		return err
+	}
+	return d.WriteCRL(validity)
 }
 
 // Issue creates a certificate signed by the CA in this directory.
@@ -242,8 +245,8 @@ func (d Dir) Issue(name string, role Role, sans []string, validity time.Duration
 }
 
 func (d Dir) issue(ca *CA, name string, role Role, sans []string, validity time.Duration) error {
-	if name == "" || name == "ca" || filepath.Base(name) != name {
-		return fmt.Errorf("invalid certificate name %q", name)
+	if err := validName(name); err != nil {
+		return err
 	}
 	cert, key, err := ca.Issue(name, role, sans, validity)
 	if err != nil {
@@ -253,6 +256,13 @@ func (d Dir) issue(ca *CA, name string, role Role, sans []string, validity time.
 		return err
 	}
 	return d.write(name+".key", key, d.privateMode())
+}
+
+func validName(name string) error {
+	if name == "" || name == "ca" || filepath.Base(name) != name {
+		return fmt.Errorf("invalid certificate name %q", name)
+	}
+	return nil
 }
 
 func (d Dir) LoadCA() (*CA, error) {
@@ -270,9 +280,31 @@ func (d Dir) LoadCA() (*CA, error) {
 // Read returns the PEM contents of a file in the directory.
 func (d Dir) Read(name string) ([]byte, error) { return os.ReadFile(d.path(name)) }
 
+// ProfileOptions are optional settings for Profile.
+type ProfileOptions struct {
+	// AuthUserPass adds "auth-user-pass": the client asks for a username and
+	// password (servers with auth-user-pass-file).
+	AuthUserPass bool
+	// NoCert leaves out the client certificate and key, for servers with
+	// "verify-client-cert none" (implies AuthUserPass). NAME then needs no
+	// certificate and only labels the profile.
+	NoCert bool
+	// Wrap embeds the client's control-channel key (tls-auth, tls-crypt or
+	// tls-crypt-v2) from the directory; see GenKey.
+	Wrap Wrap
+}
+
 // Profile renders a .ovpn client profile with the certificates inlined, for
-// the stock OpenVPN client. proto is "udp" or "tcp".
-func (d Dir) Profile(name, remote string, port int, proto string) (string, error) {
+// the stock OpenVPN client. proto is "udp" or "tcp". At most one
+// ProfileOptions may be given.
+func (d Dir) Profile(name, remote string, port int, proto string, opts ...ProfileOptions) (string, error) {
+	var opt ProfileOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if name == "" || filepath.Base(name) != name {
+		return "", fmt.Errorf("invalid profile name %q", name)
+	}
 	switch proto {
 	case "udp":
 	case "tcp":
@@ -284,11 +316,16 @@ func (d Dir) Profile(name, remote string, port int, proto string) (string, error
 	if err != nil {
 		return "", err
 	}
-	cert, err := d.Read(name + ".crt")
-	if err != nil {
-		return "", err
+	var cert, key []byte
+	if !opt.NoCert {
+		if cert, err = d.Read(name + ".crt"); err != nil {
+			return "", err
+		}
+		if key, err = d.Read(name + ".key"); err != nil {
+			return "", err
+		}
 	}
-	key, err := d.Read(name + ".key")
+	wrap, err := d.wrapBlock(name, opt.Wrap)
 	if err != nil {
 		return "", err
 	}
@@ -296,13 +333,20 @@ func (d Dir) Profile(name, remote string, port int, proto string) (string, error
 	fmt.Fprintf(&b, "# softvpn client profile for %q (stock OpenVPN 2.5+ client)\n", name)
 	fmt.Fprintf(&b, "client\ndev tun\nproto %s\nremote %s %d\n", proto, remote, port)
 	b.WriteString("nobind\nresolv-retry infinite\npersist-key\nremote-cert-tls server\nverb 3\n")
-	fmt.Fprintf(&b, "<ca>\n%s</ca>\n<cert>\n%s</cert>\n<key>\n%s</key>\n", ca, cert, key)
+	if opt.AuthUserPass || opt.NoCert {
+		b.WriteString("auth-user-pass\n")
+	}
+	fmt.Fprintf(&b, "<ca>\n%s</ca>\n", ca)
+	if !opt.NoCert {
+		fmt.Fprintf(&b, "<cert>\n%s</cert>\n<key>\n%s</key>\n", cert, key)
+	}
+	b.WriteString(wrap)
 	return b.String(), nil
 }
 
 // WriteProfile writes NAME.ovpn into the directory, replacing any old one.
-func (d Dir) WriteProfile(name, remote string, port int, proto string) error {
-	p, err := d.Profile(name, remote, port, proto)
+func (d Dir) WriteProfile(name, remote string, port int, proto string, opts ...ProfileOptions) error {
+	p, err := d.Profile(name, remote, port, proto, opts...)
 	if err != nil {
 		return err
 	}
