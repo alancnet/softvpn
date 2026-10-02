@@ -245,8 +245,8 @@ func (d Dir) Issue(name string, role Role, sans []string, validity time.Duration
 }
 
 func (d Dir) issue(ca *CA, name string, role Role, sans []string, validity time.Duration) error {
-	if name == "" || name == "ca" || filepath.Base(name) != name {
-		return fmt.Errorf("invalid certificate name %q", name)
+	if err := validName(name); err != nil {
+		return err
 	}
 	cert, key, err := ca.Issue(name, role, sans, validity)
 	if err != nil {
@@ -256,6 +256,13 @@ func (d Dir) issue(ca *CA, name string, role Role, sans []string, validity time.
 		return err
 	}
 	return d.write(name+".key", key, d.privateMode())
+}
+
+func validName(name string) error {
+	if name == "" || name == "ca" || filepath.Base(name) != name {
+		return fmt.Errorf("invalid certificate name %q", name)
+	}
+	return nil
 }
 
 func (d Dir) LoadCA() (*CA, error) {
@@ -282,6 +289,9 @@ type ProfileOptions struct {
 	// "verify-client-cert none" (implies AuthUserPass). NAME then needs no
 	// certificate and only labels the profile.
 	NoCert bool
+	// Wrap embeds the client's control-channel key (tls-auth, tls-crypt or
+	// tls-crypt-v2) from the directory; see GenKey.
+	Wrap Wrap
 }
 
 // Profile renders a .ovpn client profile with the certificates inlined, for
@@ -315,6 +325,10 @@ func (d Dir) Profile(name, remote string, port int, proto string, opts ...Profil
 			return "", err
 		}
 	}
+	wrap, err := d.wrapBlock(name, opt.Wrap)
+	if err != nil {
+		return "", err
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "# softvpn client profile for %q (stock OpenVPN 2.5+ client)\n", name)
 	fmt.Fprintf(&b, "client\ndev tun\nproto %s\nremote %s %d\n", proto, remote, port)
@@ -326,6 +340,7 @@ func (d Dir) Profile(name, remote string, port int, proto string, opts ...Profil
 	if !opt.NoCert {
 		fmt.Fprintf(&b, "<cert>\n%s</cert>\n<key>\n%s</key>\n", cert, key)
 	}
+	b.WriteString(wrap)
 	return b.String(), nil
 }
 

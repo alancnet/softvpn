@@ -64,6 +64,29 @@ push "dhcp-option DNS 10.8.0.1"
 Any directive can also go on the command line, as with OpenVPN:
 `softvpn server --config server.conf --verb 4`.
 
+### Control-channel keys
+
+`-wrap tls-auth|tls-crypt|tls-crypt-v2` on `pki init`, `pki client` and
+`pki profile` creates the keys that are missing and embeds the client's key in
+its profiles. Add the matching line to `server.conf`:
+
+| `-wrap` | key files in the PKI directory | `server.conf` | profile gets |
+|---|---|---|---|
+| `tls-auth` | `ta.key` | `tls-auth /pki/ta.key 0` | `<tls-auth>` and `key-direction 1` |
+| `tls-crypt` | `tc.key` | `tls-crypt /pki/tc.key` | `<tls-crypt>` |
+| `tls-crypt-v2` | `tls-crypt-v2.key`, plus `NAME-tls-crypt-v2.key` per client | `tls-crypt-v2 /pki/tls-crypt-v2.key` | `<tls-crypt-v2>` with that client's key |
+
+```sh
+softvpn pki init -dir /pki -wrap tls-crypt-v2 -clients laptop -remote vpn.example.com
+```
+
+`softvpn pki genkey` makes single keys, like `openvpn --genkey`:
+`genkey tls-auth`, `genkey tls-crypt`, `genkey tls-crypt-v2` (server key),
+and `genkey [-metadata TEXT] tls-crypt-v2-client NAME`. Keys go into `-dir`
+under the names above, and existing ones are kept; `-out FILE` (or `-` for
+stdout) writes elsewhere. If the server sets `auth`, put the same `auth` line
+in tls-auth client profiles.
+
 ## Authentication
 
 By default every client needs a certificate from the CA. Two optional
@@ -111,7 +134,7 @@ startup with a pointer to these directives.
 ## End-to-end test
 
 ```sh
-test/run.sh            # builds, runs 55 checks, tears down
+test/run.sh            # builds, runs 68 checks, tears down
 KEEP=1 test/run.sh     # leave it running afterwards
 ```
 
@@ -120,6 +143,7 @@ KEEP=1 test/run.sh     # leave it running afterwards
 | container | network | notes |
 |---|---|---|
 | `server` | `wan` + `edge` | softvpn; uid 65534, all capabilities dropped, read-only, no devices |
+| `server-tls-auth`, `server-tls-crypt`, `server-tls-crypt-v2` | `wan` + `edge` | the same, each with one kind of control-channel protection |
 | `web` | `wan` only | stands in for the internet: HTTP, bulk download, UDP echo |
 | `client1` | `edge` only | stock OpenVPN 2.6 over UDP; rekeys every 15 s |
 | `client2` | `edge` only | stock OpenVPN 2.6 over TCP; static IP from `client-config-dir` |
@@ -127,6 +151,10 @@ KEEP=1 test/run.sh     # leave it running afterwards
 | `client4` | `edge` only | stock OpenVPN 2.6, no certificate: username/password (`auth-user-pass`), rekeys every 15 s with an auth token |
 | `client5` | `edge` only | same profile, wrong password |
 | `client6` | `edge` only | a revoked client certificate |
+| `tlsauth-server`, `tlscrypt-server`, `tlscryptv2-server` | `wan` + `edge` | softvpn locked down like `server`, each with one kind of control-channel protection |
+| `tlsauth-client` | `edge` only | stock OpenVPN 2.6, `tls-auth` with `key-direction 1` and `auth SHA256` |
+| `tlscrypt-client` | `edge` only | stock OpenVPN 2.6, `tls-crypt` over TCP; rekeys every 15 s |
+| `tlscryptv2-client`, `tlscryptv2-client25` | `edge` only | `tls-crypt-v2` with OpenVPN 2.6 and 2.5 |
 | `probe` | `edge` only | no VPN; proves `edge` can't reach anything by itself |
 | `tapserver` | `wan` + `tapedge` | softvpn with `dev tap` and `server-bridge` ([server-tap.conf](test/server-tap.conf)); locked down like `server` |
 | `tapclient1` | `tapedge` only | stock OpenVPN 2.6 with `dev tap` over UDP |
@@ -154,6 +182,12 @@ MAC, ping, `redirect-gateway`, TCP/UDP/ICMP NAT and DNS, client-to-client
 over the Ethernet segment (the peer's MAC in the ARP cache), a 50 MB
 transfer, dropping a source address the server did not assign, and a DHCP
 lease from the built-in DHCP server with OpenVPN's `route-gateway dhcp`.
+For control-channel protection they check that each wrapped client connects
+and is NATed by its server, that clients with the wrong HMAC digest, no key,
+or a tls-crypt-v2 key from another server are refused, that a tls-crypt-v2
+client key made by the stock `openvpn --genkey` from softvpn's server key is
+accepted, and renegotiation over tls-crypt; all of those keys and profiles
+come from softvpn's own generator (the `pki-tls-*` containers).
 
 No container is privileged. The OpenVPN *clients* get `/dev/net/tun` and the
 single capability `NET_ADMIN`, because the stock client always creates a
@@ -166,6 +200,20 @@ neither.
   extension; OpenVPN takes only one).
 - TLS 1.2/1.3 control channel with mutual certificate authentication, plus
   OpenVPN's control-channel reliability layer.
+- Control-channel protection, one per server:
+  - `tls-auth FILE [0|1]` (or an inline `<tls-auth>` block with
+    `key-direction`): HMAC on every control packet, with the digest from
+    `auth` (SHA1 by default; SHA224/256/384/512).
+  - `tls-crypt FILE`: control packets encrypted and authenticated with
+    AES-256-CTR and HMAC-SHA256.
+  - `tls-crypt-v2 FILE` (the server key): like tls-crypt, but every client has
+    its own key, which it sends wrapped by the server key in its first packet
+    (`P_CONTROL_HARD_RESET_CLIENT_V3`, and `P_CONTROL_WKC_V1` if sent).
+
+  Packets that fail the check, or repeat a packet id, are dropped before any
+  state is created for them. Key files are OpenVPN's formats, so keys from
+  `openvpn --genkey` work, and `softvpn pki` makes the same keys without an
+  openvpn binary.
 - Certificate revocation: `crl-verify FILE` (PEM or DER), re-read when it
   changes; `softvpn pki revoke` maintains it.
 - Username/password authentication from a built-in user database instead of
@@ -221,7 +269,8 @@ softvpn doesn't implement are rejected at startup.
 
 ## Not supported (yet)
 
-- `tls-auth`, `tls-crypt`, and `tls-crypt-v2`: remove them from client profiles.
+- `tls-crypt-v2-verify` and `tls-crypt-v2-max-age`: client key metadata is
+  not checked.
 - Compression (`compress`, `comp-lzo`): clients must not enable it.
 - Plugins and scripts (`plugin`, `auth-user-pass-verify`, `client-connect`,
   ...): use the built-in user database instead. Deferred authentication,
@@ -236,10 +285,10 @@ softvpn doesn't implement are rejected at startup.
 
 | path | what |
 |---|---|
-| [cmd/softvpn](cmd/softvpn/main.go) | CLI: `server`, `pki init/client/profile/revoke/crl/list`, `user add/passwd/del/list` |
-| [internal/ovpn](internal/ovpn) | OpenVPN protocol: packets, reliability layer, TLS-over-control-channel, key exchange, data-channel crypto, UDP/TCP transports |
+| [cmd/softvpn](cmd/softvpn/main.go) | CLI: `server`, `pki init/client/profile/revoke/crl/list/genkey`, `user add/passwd/del/list` |
+| [internal/ovpn](internal/ovpn) | OpenVPN protocol: packets, reliability layer, tls-auth/tls-crypt/tls-crypt-v2 and their key formats, TLS-over-control-channel, key exchange, data-channel crypto, UDP/TCP transports |
 | [internal/server](internal/server) | config, address pool, virtual router, soft-NAT policy, ICMP NAT; TAP mode's virtual switch and DHCP server |
 | [internal/vnet](internal/vnet) | gVisor stack in promiscuous/spoofing mode, TCP/UDP forwarders (the NAT) |
-| [internal/pki](internal/pki) | minimal CA (easy-rsa replacement), CRL, and `.ovpn` profile generation |
+| [internal/pki](internal/pki) | minimal CA (easy-rsa replacement), CRL, control-channel keys, and `.ovpn` profile generation |
 | [internal/users](internal/users) | user database for `auth-user-pass-file` (htpasswd-style bcrypt file) |
 | [internal/config](internal/config) | OpenVPN config syntax: directives, quoting, inline `<ca>` blocks, argv |

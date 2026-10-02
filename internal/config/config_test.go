@@ -64,3 +64,29 @@ func TestArgsOverrideFile(t *testing.T) {
 		t.Fatal("stray argument accepted")
 	}
 }
+
+func TestMaterialArgs(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "ta.key"), []byte("KEY"), 0o644)
+	os.WriteFile(filepath.Join(dir, "a.conf"), []byte("tls-auth ta.key 0\n"), 0o644)
+	c, err := ParseFile(filepath.Join(dir, "a.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, args, err := c.MaterialArgs("tls-auth", 1)
+	if err != nil || string(b) != "KEY" || len(args) != 1 || args[0] != "0" {
+		t.Fatalf("file with direction: %q %v %v", b, args, err)
+	}
+	if _, err := c.Material("tls-auth"); err == nil {
+		t.Fatal("extra argument accepted by Material")
+	}
+
+	c, _ = ParseString("tls-auth [inline] 1\n<tls-auth>\nINLINE\n</tls-auth>\n")
+	if b, args, err := c.MaterialArgs("tls-auth", 1); err != nil || string(b) != "INLINE\n" || args[0] != "1" {
+		t.Fatalf("[inline]: %q %v %v", b, args, err)
+	}
+	c, _ = ParseString("<tls-crypt>\nINLINE\n</tls-crypt>\n")
+	if !c.HasMaterial("tls-crypt") || c.HasMaterial("tls-auth") {
+		t.Fatal("HasMaterial")
+	}
+}

@@ -16,6 +16,9 @@
 # reach on "wan" or the internet must have gone through the VPN and been
 # NATed in software by the server.
 #
+# tlsauth-server, tlscrypt-server and tlscryptv2-server are the same server
+# with each kind of control-channel protection, for the tls*-client clients.
+#
 # server:  no capabilities at all, uid 65534, read-only root filesystem.
 # clients: the stock OpenVPN client. Not privileged, but like any OpenVPN
 #          client it needs a TUN device, so it gets /dev/net/tun and
@@ -84,6 +87,26 @@ services:
     depends_on: { pki-alice: { condition: service_completed_successfully } }
     command: [user, add, -file, /pki/users, -password, opensesame, alice]
 
+  # ... then control-channel keys (ta.key, tc.key, tls-crypt-v2.key and a
+  # tls-crypt-v2 key per client) and profiles that embed them, all from
+  # softvpn's own key generator. tlscryptv2-trial has no container: run.sh
+  # uses it for throwaway trial clients.
+  pki-tls-auth:
+    <<: *pki
+    build: !reset null
+    depends_on: { users: { condition: service_completed_successfully } }
+    command: [pki, init, -dir, /pki, -wrap, tls-auth, -clients, tlsauth-client, -remote, tlsauth-server, -shared]
+  pki-tls-crypt:
+    <<: *pki
+    build: !reset null
+    depends_on: { pki-tls-auth: { condition: service_completed_successfully } }
+    command: [pki, init, -dir, /pki, -wrap, tls-crypt, -clients, tlscrypt-client, -remote, tlscrypt-server, -shared]
+  pki-tls-crypt-v2:
+    <<: *pki
+    build: !reset null
+    depends_on: { pki-tls-crypt: { condition: service_completed_successfully } }
+    command: [pki, init, -dir, /pki, -wrap, tls-crypt-v2, -clients, "tlscryptv2-client,tlscryptv2-client25,tlscryptv2-trial", -remote, tlscryptv2-server, -shared]
+
   server:
     &server
     <<: *locked-down
@@ -120,6 +143,33 @@ services:
     networks:
       wan: { ipv4_address: "${SVT_NET:-10.231}.10.102" }
       dhcpedge: { ipv4_address: "${SVT_NET:-10.231}.40.100", aliases: [server] }
+
+  # The same server.conf plus control-channel protection on the command
+  # line. tls-auth also uses a non-default HMAC digest ("auth SHA256").
+  tlsauth-server:
+    <<: *server
+    depends_on:
+      pki-tls-crypt-v2: { condition: service_completed_successfully }
+    command: [server, --config, /etc/softvpn/server.conf, --tls-auth, /pki/ta.key, "0", --auth, SHA256]
+    networks:
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.111" }
+      edge: { ipv4_address: "${SVT_NET:-10.231}.20.111" }
+  tlscrypt-server:
+    <<: *server
+    depends_on:
+      pki-tls-crypt-v2: { condition: service_completed_successfully }
+    command: [server, --config, /etc/softvpn/server.conf, --tls-crypt, /pki/tc.key]
+    networks:
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.112" }
+      edge: { ipv4_address: "${SVT_NET:-10.231}.20.112" }
+  tlscryptv2-server:
+    <<: *server
+    depends_on:
+      pki-tls-crypt-v2: { condition: service_completed_successfully }
+    command: [server, --config, /etc/softvpn/server.conf, --tls-crypt-v2, /pki/tls-crypt-v2.key]
+    networks:
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.113" }
+      edge: { ipv4_address: "${SVT_NET:-10.231}.20.113" }
 
   # Stand-in for the internet, reachable only from the server's network.
   web:
@@ -158,6 +208,7 @@ services:
   # An older OpenVPN (2.5.10): no tls-ekm, so keys come from OpenVPN's legacy
   # PRF; and it only offers ChaCha20-Poly1305.
   client3:
+    &client25
     <<: *client
     build: { context: ./tools, args: { ALPINE: "3.17" } }
     image: softvpn-test-tools${SVT_ID:-}:openvpn-2.5
@@ -182,6 +233,26 @@ services:
   client6:
     <<: *client
     command: [sh, -c, "exec client-entrypoint.sh --config /pki/revoked/revoked-*.ovpn"]
+
+  # Control-channel protection: tls-auth (key-direction 1, HMAC-SHA256) over
+  # UDP; tls-crypt over TCP, rekeying every 15s; tls-crypt-v2 with OpenVPN
+  # 2.6 and with 2.5.
+  tlsauth-client:
+    <<: *client
+    depends_on: [tlsauth-server]
+    command: [client-entrypoint.sh, --config, /pki/tlsauth-client.ovpn, --auth, SHA256]
+  tlscrypt-client:
+    <<: *client
+    depends_on: [tlscrypt-server]
+    command: [client-entrypoint.sh, --config, /pki/tlscrypt-client.ovpn, --proto, tcp-client, --reneg-sec, "15"]
+  tlscryptv2-client:
+    <<: *client
+    depends_on: [tlscryptv2-server]
+    command: [client-entrypoint.sh, --config, /pki/tlscryptv2-client.ovpn]
+  tlscryptv2-client25:
+    <<: *client25
+    depends_on: [tlscryptv2-server]
+    command: [client-entrypoint.sh, --config, /pki/tlscryptv2-client25.ovpn]
 
   # On the same isolated network as the clients but without a VPN: shows that
   # nothing is reachable from "edge" except through the tunnel.
