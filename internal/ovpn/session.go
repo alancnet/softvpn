@@ -21,6 +21,9 @@ type Assignment struct {
 	Netmask string // dotted quad, for "ifconfig"
 	Gateway netip.Addr
 	Push    []string
+	// Compress is the client's compression framing ("compress"/"comp-lzo"
+	// from server.conf or client-config-dir); it is pushed to the client.
+	Compress Compress
 }
 
 // Handler connects sessions to the application (the virtual router).
@@ -61,6 +64,11 @@ type Session struct {
 	useEKM bool
 	assign *Assignment
 	pushed bool
+
+	pushCipher bool       // negotiated with a client that takes a pushed cipher
+	clientComp bool       // client announced compression (OCC "comp-lzo")
+	comp       compressor // set before the first data key is published
+	compPush   string
 
 	primary      atomic.Pointer[keyState] // key used to send data
 	useV2        atomic.Bool
@@ -227,6 +235,10 @@ func (s *Session) inputData(op byte, b []byte) bool {
 		return false
 	}
 	s.lastRecv.Store(time.Now().UnixNano())
+	if pt, err = s.comp.unframe(pt); err != nil {
+		s.log.Debug("dropping data packet", "err", err)
+		return true
+	}
 	switch {
 	case bytes.Equal(pt, pingMagic):
 	case len(pt) > len(occMagic) && bytes.HasPrefix(pt, occMagic):
@@ -260,7 +272,7 @@ func (s *Session) sendData(pt []byte) error {
 		hdr = []byte{opDataV1<<3 | ks.id}
 	}
 	s.lastDataSent.Store(time.Now().UnixNano())
-	return s.tr.send(dk.seal(hdr, pt))
+	return s.tr.send(dk.seal(hdr, s.comp.frame(pt)))
 }
 
 // runKey drives one key state: TLS handshake, key exchange, then control
@@ -309,9 +321,16 @@ func (s *Session) runKey(ks *keyState) {
 		s.cn = cn
 		s.pi = parsePeerInfo(km.peerInfo)
 		s.log = s.log.With("client", cn)
+		s.log.Debug("key exchange", "options", km.options, "peer_info", strings.ReplaceAll(km.peerInfo, "\n", " "))
 		s.useEKM = s.pi.protoFlags()&ivProtoTLSKeyExport != 0
 		s.useV2.Store(s.pi.protoFlags()&ivProtoDataV2 != 0)
-		s.cipher, _ = negotiateCipher(s.srv.opt.Ciphers, s.pi)
+		occCipher, _ := occOption(km.options, "cipher")
+		s.cipher, s.pushCipher = negotiateCipher(s.srv.opt.Ciphers, s.pi, occCipher, s.srv.opt.CipherFallback)
+		_, s.clientComp = occOption(km.options, "comp-lzo")
+		if auth, _ := occOption(km.options, "auth"); isCBC(s.cipher) && auth != "" && !strings.EqualFold(auth, s.srv.opt.Auth) {
+			s.log.Warn("client uses a different auth digest; its data packets will fail authentication",
+				"client_auth", auth, "server_auth", s.srv.opt.Auth)
+		}
 	}
 	sameCN, cipherName, useEKM := s.cn == cn, s.cipher, s.useEKM
 	s.mu.Unlock()
@@ -350,13 +369,14 @@ func (s *Session) runKey(ks *keyState) {
 		s.mu.Lock()
 		s.assign = a
 		s.mu.Unlock()
+		s.setCompression(a)
 		// Hold the first keepalive back a full interval: the client cannot
 		// decrypt until it has processed our key exchange message.
 		s.lastDataSent.Store(time.Now().UnixNano())
 		s.connected.Store(true)
 	}
 
-	dk, err := newDataKeys(cipherName, block)
+	dk, err := newDataKeys(cipherName, s.srv.opt.Auth, block)
 	if err != nil {
 		fail("data channel keys", err)
 		return
@@ -435,8 +455,15 @@ func (s *Session) controlMessage(conn *tls.Conn, msg string) {
 			if s.useEKM {
 				kdf = "tls-ekm"
 			}
-			s.log.Info("client connected", "ip", a.IP, "cipher", s.cipher, "key_derivation", kdf,
-				"version", s.pi["IV_VER"], "platform", s.pi["IV_PLAT"])
+			attrs := []any{"ip", a.IP, "cipher", s.cipher, "key_derivation", kdf,
+				"version", s.pi["IV_VER"], "platform", s.pi["IV_PLAT"]}
+			if isCBC(s.cipher) {
+				attrs = append(attrs, "auth", s.srv.opt.Auth)
+			}
+			if s.comp.mode != CompressUnset {
+				attrs = append(attrs, "compress", s.comp.mode)
+			}
+			s.log.Info("client connected", attrs...)
 		}
 	case msg == "EXIT" || strings.HasPrefix(msg, "EXIT,"):
 		go s.Close("client exited")
@@ -460,7 +487,12 @@ func (s *Session) pushReply(a *Assignment) []string {
 	if s.useV2.Load() {
 		opts = append(opts, fmt.Sprintf("peer-id %d", s.peerID))
 	}
-	opts = append(opts, "cipher "+s.cipher)
+	if s.pushCipher {
+		opts = append(opts, "cipher "+s.cipher)
+	}
+	if s.compPush != "" {
+		opts = append(opts, s.compPush)
+	}
 	var flags []string
 	if s.pi.protoFlags()&ivProtoCCExitNotify != 0 {
 		flags = append(flags, "cc-exit")

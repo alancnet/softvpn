@@ -86,10 +86,14 @@ func (s *Server) Run(ctx context.Context) error {
 	engine := ovpn.NewServer(ovpn.Options{
 		TLS:             s.cfg.TLS,
 		Ciphers:         s.cfg.Ciphers,
+		CipherFallback:  s.cfg.CipherFallback,
+		Auth:            s.cfg.Auth,
 		PingInterval:    s.cfg.PingInterval,
 		PingTimeout:     2 * s.cfg.PingTimeout, // OpenVPN doubles the server side
 		PushPing:        s.cfg.PingInterval,
 		PushPingRestart: s.cfg.PingTimeout,
+
+		AllowCompression: s.cfg.AllowCompression,
 	}, s, s.log)
 
 	errc := make(chan error, len(s.cfg.Listeners))
@@ -178,12 +182,17 @@ func (s *Server) Connect(ss *ovpn.Session) (*ovpn.Assignment, error) {
 		push = append(push, s.cfg.Push...)
 	}
 	push = append(push, cc.Push...)
-	return &ovpn.Assignment{
+	a := &ovpn.Assignment{
 		IP:      ip,
 		Netmask: net.IP(net.CIDRMask(s.cfg.Subnet.Bits(), 32)).String(),
 		Gateway: s.cfg.Gateway,
 		Push:    push,
-	}, nil
+	}
+	a.Compress = s.cfg.Compress
+	if cc.Compress != ovpn.CompressUnset {
+		a.Compress = cc.Compress
+	}
+	return a, nil
 }
 
 // Disconnect implements ovpn.Handler.

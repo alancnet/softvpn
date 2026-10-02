@@ -20,6 +20,7 @@ var directives = []string{
 	"port", "proto", "local", "dev", "server", "topology", "ca", "cert", "key",
 	"client-to-client", "duplicate-cn", "keepalive", "push", "client-config-dir",
 	"max-clients", "data-ciphers", "ncp-ciphers", "tun-mtu", "status", "verb",
+	"cipher", "data-ciphers-fallback", "auth", "compress", "comp-lzo", "allow-compression",
 	// softvpn extensions
 	"upstream-dns", "nat-allow", "nat-deny",
 }
@@ -27,9 +28,9 @@ var directives = []string{
 // Directives that only make sense for a kernel-based OpenVPN, accepted so an
 // existing server.conf works unchanged.
 var ignored = []string{
-	"dh", "persist-key", "persist-tun", "user", "group", "cipher", "auth",
+	"dh", "persist-key", "persist-tun", "user", "group",
 	"explicit-exit-notify", "ifconfig-pool-persist", "tls-server", "mode",
-	"data-ciphers-fallback", "tls-version-min", "remote-cert-tls", "mute",
+	"tls-version-min", "remote-cert-tls", "mute",
 	"log", "log-append", "daemon", "script-security", "sndbuf", "rcvbuf",
 	"txqueuelen", "fast-io", "mssfix", "tun-mtu-extra", "dev-type",
 }
@@ -61,6 +62,11 @@ type Config struct {
 	StatusFile     string
 	StatusInterval time.Duration
 	Verb           int
+
+	CipherFallback   string // data-ciphers-fallback, for clients that cannot negotiate
+	Auth             string // HMAC digest for CBC ciphers
+	Compress         ovpn.Compress
+	AllowCompression ovpn.AllowCompression
 }
 
 // Load validates directives and builds a server Config.
@@ -162,11 +168,40 @@ func Load(c *config.Config) (*Config, error) {
 			cfg.Ciphers = nil
 			for _, ci := range strings.Split(d.Arg(0), ":") {
 				if !supported(ci) {
-					return nil, d.Errorf("unsupported cipher %q (supported: %s)", ci, strings.Join(ovpn.SupportedCiphers, ":"))
+					return nil, d.Errorf("unsupported cipher %q (supported: %s)", ci, allCiphers())
 				}
 				cfg.Ciphers = append(cfg.Ciphers, strings.ToUpper(ci))
 			}
 		}
+	}
+
+	// OpenVPN 2.6 semantics: "cipher" only matters for clients that cannot
+	// negotiate, as a fallback when it is not in data-ciphers.
+	for _, name := range []string{"cipher", "data-ciphers-fallback"} {
+		if d, ok := c.Last(name); ok {
+			if !supported(d.Arg(0)) {
+				return nil, d.Errorf("unsupported cipher %q (supported: %s)", d.Arg(0), allCiphers())
+			}
+			ci := strings.ToUpper(d.Arg(0))
+			if name == "data-ciphers-fallback" || !supportedIn(ci, cfg.Ciphers) {
+				cfg.CipherFallback = ci
+			}
+		}
+	}
+	cfg.Auth = "SHA1"
+	if d, ok := c.Last("auth"); ok {
+		if !ovpn.DigestSupported(d.Arg(0)) {
+			return nil, d.Errorf("unsupported digest %q (supported: %s)", d.Arg(0), strings.Join(ovpn.Digests, ", "))
+		}
+		cfg.Auth = strings.ToUpper(d.Arg(0))
+	}
+	if d, ok := c.Last("allow-compression"); ok {
+		if cfg.AllowCompression, err = ovpn.ParseAllowCompression(d.Arg(0)); err != nil {
+			return nil, d.Errorf("%v", err)
+		}
+	}
+	if cfg.Compress, err = cfg.compression(c); err != nil {
+		return nil, err
 	}
 
 	for _, d := range c.All("push") {
@@ -227,13 +262,39 @@ func Load(c *config.Config) (*Config, error) {
 	return cfg, nil
 }
 
-func supported(cipher string) bool {
-	for _, s := range ovpn.SupportedCiphers {
+func supported(cipher string) bool { return ovpn.CipherSupported(cipher) }
+
+func supportedIn(cipher string, list []string) bool {
+	for _, s := range list {
 		if strings.EqualFold(s, cipher) {
 			return true
 		}
 	}
 	return false
+}
+
+func allCiphers() string {
+	return strings.Join(append(append([]string(nil), ovpn.SupportedCiphers...), ovpn.CBCCiphers...), ":")
+}
+
+// compression reads the last "compress" or "comp-lzo" directive.
+// allow-compression no permits only the framing stubs, as in OpenVPN 2.6.
+func (cfg *Config) compression(c *config.Config) (ovpn.Compress, error) {
+	var mode ovpn.Compress
+	for _, d := range c.Directives {
+		if d.Name != "compress" && d.Name != "comp-lzo" {
+			continue
+		}
+		m, err := ovpn.ParseCompress(d.Name, d.Arg(0))
+		if err != nil {
+			return 0, d.Errorf("%v", err)
+		}
+		if !m.Stub() && cfg.AllowCompression == ovpn.AllowCompressionNo {
+			return 0, d.Errorf("compression is not allowed with allow-compression no (only stub framing is)")
+		}
+		mode = m
+	}
+	return mode, nil
 }
 
 func parsePrefix(s string) (netip.Prefix, error) {
@@ -282,6 +343,7 @@ type clientConfig struct {
 	Push     []string
 	NoPush   bool // push-reset
 	Disabled bool
+	Compress ovpn.Compress // compress / comp-lzo, overriding server.conf
 }
 
 func (cfg *Config) loadCCD(cn string) (*clientConfig, error) {
@@ -297,7 +359,10 @@ func (cfg *Config) loadCCD(cn string) (*clientConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := c.Check("ifconfig-push", "push", "push-reset", "disable", "iroute"); err != nil {
+	if err := c.Check("ifconfig-push", "push", "push-reset", "disable", "iroute", "compress", "comp-lzo"); err != nil {
+		return nil, err
+	}
+	if cc.Compress, err = cfg.compression(c); err != nil {
 		return nil, err
 	}
 	cc.Disabled = c.Has("disable")
