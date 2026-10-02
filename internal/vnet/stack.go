@@ -15,6 +15,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -23,22 +24,26 @@ import (
 
 const nicID tcpip.NICID = 1
 
-// Stack is a userspace IPv4 network stack with one virtual interface.
+// Stack is a userspace IPv4/IPv6 network stack with one virtual interface.
 type Stack struct {
 	s      *stack.Stack
 	ep     *channel.Endpoint
 	cancel context.CancelFunc
 
 	mu   sync.Mutex
-	addr netip.Prefix
+	addr [2]netip.Prefix // per family: [0] IPv4, [1] IPv6
 }
 
 // New creates a stack whose outbound packets are passed to out. out is
 // called from a single goroutine and owns the slice it receives.
 func New(mtu int, out func(pkt []byte)) (*Stack, error) {
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4},
+		// IPv6 with gVisor's defaults: no DAD, no router solicitations, no
+		// SLAAC or link-local address, no MLD. The NIC has no link address,
+		// so there is no neighbor discovery either; it is a point-to-point
+		// link like the client's tun.
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 		// HandleLocal must stay off: in promiscuous mode every source address
 		// would look local and gVisor would drop all inbound packets.
 		HandleLocal: false,
@@ -59,7 +64,10 @@ func New(mtu int, out func(pkt []byte)) (*Stack, error) {
 	if err := s.CreateNIC(nicID, ep); err != nil {
 		return nil, fmt.Errorf("create NIC: %s", err)
 	}
-	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: nicID}})
+	s.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: nicID},
+		{Destination: header.IPv6EmptySubnet, NIC: nicID},
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	st := &Stack{s: s, ep: ep, cancel: cancel}
@@ -87,25 +95,38 @@ func (st *Stack) Close() {
 	st.s.Close()
 }
 
-// Inject delivers an IPv4 packet received from the tunnel to the stack.
+// Inject delivers an IPv4 or IPv6 packet received from the tunnel to the
+// stack.
 func (st *Stack) Inject(pkt []byte) {
+	if len(pkt) == 0 {
+		return
+	}
+	proto := ipv4.ProtocolNumber
+	if pkt[0]>>4 == 6 {
+		proto = ipv6.ProtocolNumber
+	}
 	pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(pkt)})
-	st.ep.InjectInbound(ipv4.ProtocolNumber, pb)
+	st.ep.InjectInbound(proto, pb)
 	pb.DecRef()
 }
 
-// SetAddress assigns the interface address, replacing any previous one.
+// SetAddress assigns the interface address, replacing any previous one of
+// the same family.
 func (st *Stack) SetAddress(p netip.Prefix) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.addr == p {
+	fam, proto := 0, ipv4.ProtocolNumber
+	if p.Addr().Is6() {
+		fam, proto = 1, ipv6.ProtocolNumber
+	}
+	if st.addr[fam] == p {
 		return nil
 	}
-	if st.addr.IsValid() {
-		st.s.RemoveAddress(nicID, toTCPIP(st.addr.Addr()))
+	if st.addr[fam].IsValid() {
+		st.s.RemoveAddress(nicID, toTCPIP(st.addr[fam].Addr()))
 	}
 	pa := tcpip.ProtocolAddress{
-		Protocol: ipv4.ProtocolNumber,
+		Protocol: proto,
 		AddressWithPrefix: tcpip.AddressWithPrefix{
 			Address:   toTCPIP(p.Addr()),
 			PrefixLen: p.Bits(),
@@ -114,11 +135,16 @@ func (st *Stack) SetAddress(p netip.Prefix) error {
 	if err := st.s.AddProtocolAddress(nicID, pa, stack.AddressProperties{}); err != nil {
 		return fmt.Errorf("add address %s: %s", p, err)
 	}
-	st.addr = p
+	st.addr[fam] = p
 	return nil
 }
 
-func toTCPIP(a netip.Addr) tcpip.Address { return tcpip.AddrFrom4(a.Unmap().As4()) }
+func toTCPIP(a netip.Addr) tcpip.Address {
+	if a.Is6() && !a.Is4In6() {
+		return tcpip.AddrFrom16(a.As16())
+	}
+	return tcpip.AddrFrom4(a.Unmap().As4())
+}
 
 func fromTCPIP(a tcpip.Address) netip.Addr {
 	if a.Len() == 4 {

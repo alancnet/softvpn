@@ -3,6 +3,7 @@ package ovpn
 import (
 	"bytes"
 	"encoding/binary"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -218,5 +219,22 @@ func TestPushReplyContinuation(t *testing.T) {
 	}
 	if got := strings.Count(strings.Join(msgs, ""), "route 192.168.100.0"); got != 60 {
 		t.Fatalf("lost options: %d", got)
+	}
+}
+
+func TestPushReplyIPv6(t *testing.T) {
+	s := &Session{srv: &Server{opt: Options{PushPing: 10 * time.Second, PushPingRestart: 60 * time.Second}}, cipher: "AES-256-GCM", pi: peerInfo{}}
+	a := &Assignment{
+		IP: netip.MustParseAddr("10.8.0.2"), Netmask: "255.255.255.0", Gateway: netip.MustParseAddr("10.8.0.1"),
+		IP6: netip.MustParsePrefix("fd00:8::1000/64"), Gateway6: netip.MustParseAddr("fd00:8::1"),
+	}
+	msgs := s.pushReply(a)
+	if len(msgs) != 1 || !strings.Contains(msgs[0], ",ifconfig-ipv6 fd00:8::1000/64 fd00:8::1,") ||
+		!strings.Contains(msgs[0], ",ifconfig 10.8.0.2 255.255.255.0") {
+		t.Fatalf("push reply: %q", msgs)
+	}
+	a.IP6 = netip.Prefix{}
+	if msgs := s.pushReply(a); strings.Contains(msgs[0], "ifconfig-ipv6") {
+		t.Fatalf("ifconfig-ipv6 pushed without an IPv6 address: %q", msgs)
 	}
 }

@@ -1,1 +1,2 @@
 ifconfig-push 10.8.0.20 255.255.255.0
+ifconfig-ipv6-push fd00:8::20/64

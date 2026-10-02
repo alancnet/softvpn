@@ -17,10 +17,12 @@ import (
 // Assignment is what the application decides for a newly authenticated
 // client: its address and any extra options to push.
 type Assignment struct {
-	IP      netip.Addr
-	Netmask string // dotted quad, for "ifconfig"
-	Gateway netip.Addr
-	Push    []string
+	IP       netip.Addr
+	Netmask  string // dotted quad, for "ifconfig"
+	Gateway  netip.Addr
+	IP6      netip.Prefix // address/bits for "ifconfig-ipv6"; optional
+	Gateway6 netip.Addr
+	Push     []string
 }
 
 // Handler connects sessions to the application (the virtual router).
@@ -435,8 +437,12 @@ func (s *Session) controlMessage(conn *tls.Conn, msg string) {
 			if s.useEKM {
 				kdf = "tls-ekm"
 			}
-			s.log.Info("client connected", "ip", a.IP, "cipher", s.cipher, "key_derivation", kdf,
-				"version", s.pi["IV_VER"], "platform", s.pi["IV_PLAT"])
+			attrs := []any{"ip", a.IP}
+			if a.IP6.IsValid() {
+				attrs = append(attrs, "ip6", a.IP6.Addr())
+			}
+			s.log.Info("client connected", append(attrs, "cipher", s.cipher, "key_derivation", kdf,
+				"version", s.pi["IV_VER"], "platform", s.pi["IV_PLAT"])...)
 		}
 	case msg == "EXIT" || strings.HasPrefix(msg, "EXIT,"):
 		go s.Close("client exited")
@@ -455,8 +461,11 @@ func (s *Session) pushReply(a *Assignment) []string {
 		"topology subnet",
 		fmt.Sprintf("ping %d", int(opt.PushPing/time.Second)),
 		fmt.Sprintf("ping-restart %d", int(opt.PushPingRestart/time.Second)),
-		"ifconfig "+a.IP.String()+" "+a.Netmask,
 	)
+	if a.IP6.IsValid() {
+		opts = append(opts, "ifconfig-ipv6 "+a.IP6.String()+" "+a.Gateway6.String())
+	}
+	opts = append(opts, "ifconfig "+a.IP.String()+" "+a.Netmask)
 	if s.useV2.Load() {
 		opts = append(opts, fmt.Sprintf("peer-id %d", s.peerID))
 	}
