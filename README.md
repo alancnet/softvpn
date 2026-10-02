@@ -64,10 +64,54 @@ push "dhcp-option DNS 10.8.0.1"
 Any directive can also go on the command line, as with OpenVPN:
 `softvpn server --config server.conf --verb 4`.
 
+## Authentication
+
+By default every client needs a certificate from the CA. Two optional
+additions, both plain files that the server re-reads when they change:
+
+**Revocation.** `pki init` writes an empty `crl.pem`, and
+`softvpn pki revoke NAME` adds a client's certificate to it (and moves its
+files to `revoked/`, so the name can be issued again). With
+`crl-verify /pki/crl.pem` the server refuses revoked certificates in every TLS
+handshake, renegotiations included, and disconnects already-connected clients
+within seconds of the CRL changing. Any PEM or DER CRL signed by the CA works.
+
+**Usernames and passwords.** The image has no shell and cannot load plugins,
+so instead of `auth-user-pass-verify` scripts softvpn has a built-in user
+database: an htpasswd-style file of bcrypt hashes (`htpasswd -B` files work
+too).
+
+```sh
+docker run --rm -i -v softvpn-pki:/pki alancnet/softvpn user add -file /pki/users alice   # password on stdin
+docker run --rm -v softvpn-pki:/pki alancnet/softvpn user list -file /pki/users
+#   user passwd|del -file FILE [-password PW] NAME
+docker run --rm -v softvpn-pki:/pki alancnet/softvpn \
+  pki profile -dir /pki -remote vpn.example.com -auth-user-pass -no-cert alice > alice.ovpn
+```
+
+```
+auth-user-pass-file /pki/users
+verify-client-cert none         # or optional (certificate if given), require (default)
+username-as-common-name         # the session (and its client-config-dir file) is named after the user
+auth-gen-token                  # renegotiate and reconnect with a token instead of the password
+```
+
+Credentials are checked on every key exchange, so a changed password or a
+deleted user takes effect at the client's next renegotiation; deleting a user
+also disconnects their sessions immediately. `auth-user-pass-optional` lets
+clients with a valid certificate skip the password. `auth-gen-token [LIFETIME]`
+tokens are signed with a random per-start secret (or `auth-gen-token-secret
+FILE`) and bound to the user's current password hash; stock clients fall
+back to their cached password when a token is refused, for example after a
+server restart. Without `username-as-common-name`, password-only clients
+share OpenVPN's common name `UNDEF` (add `duplicate-cn` in that case).
+`plugin`, `auth-user-pass-verify` and other script hooks are rejected at
+startup with a pointer to these directives.
+
 ## End-to-end test
 
 ```sh
-test/run.sh            # builds, runs 43 checks, tears down
+test/run.sh            # builds, runs 55 checks, tears down
 KEEP=1 test/run.sh     # leave it running afterwards
 ```
 
@@ -80,6 +124,9 @@ KEEP=1 test/run.sh     # leave it running afterwards
 | `client1` | `edge` only | stock OpenVPN 2.6 over UDP; rekeys every 15 s |
 | `client2` | `edge` only | stock OpenVPN 2.6 over TCP; static IP from `client-config-dir` |
 | `client3` | `edge` only | stock OpenVPN 2.5 with ChaCha20-Poly1305 and legacy key derivation |
+| `client4` | `edge` only | stock OpenVPN 2.6, no certificate: username/password (`auth-user-pass`), rekeys every 15 s with an auth token |
+| `client5` | `edge` only | same profile, wrong password |
+| `client6` | `edge` only | a revoked client certificate |
 | `probe` | `edge` only | no VPN; proves `edge` can't reach anything by itself |
 | `tapserver` | `wan` + `tapedge` | softvpn with `dev tap` and `server-bridge` ([server-tap.conf](test/server-tap.conf)); locked down like `server` |
 | `tapclient1` | `tapedge` only | stock OpenVPN 2.6 with `dev tap` over UDP |
@@ -94,7 +141,14 @@ effective capability set), address assignment, `redirect-gateway`, TCP, UDP,
 and ICMP NAT (the web server sees the server's address), DNS through the VPN
 gateway, client-to-client routing, a 50 MB transfer with throughput, real
 HTTPS to example.com through the server's default gateway, and traffic
-continuing across key renegotiations. In TAP mode they cover the same
+continuing across key renegotiations, password login and AUTH_FAILED for a
+wrong password, re-authentication with an auth token on renegotiation,
+refusal of a revoked certificate, and live changes: revoking a connected
+client's certificate (`pki revoke`) and deleting a connected user
+(`user del`) disconnect them within seconds, without a server restart. The
+one-shot `pki`, `pki-revoke`, `pki-alice` and `users` containers set up the
+PKI, CRL and user database with the server image itself (it has no shell).
+In TAP mode they cover the same
 lockdown, `server-bridge` pool addresses, ARP resolution of the gateway's
 MAC, ping, `redirect-gateway`, TCP/UDP/ICMP NAT and DNS, client-to-client
 over the Ethernet segment (the peer's MAC in the ARP cache), a 50 MB
@@ -112,6 +166,13 @@ neither.
   extension; OpenVPN takes only one).
 - TLS 1.2/1.3 control channel with mutual certificate authentication, plus
   OpenVPN's control-channel reliability layer.
+- Certificate revocation: `crl-verify FILE` (PEM or DER), re-read when it
+  changes; `softvpn pki revoke` maintains it.
+- Username/password authentication from a built-in user database instead of
+  scripts or plugins: `auth-user-pass-file` (softvpn extension),
+  `verify-client-cert none|optional|require`, `username-as-common-name`,
+  `auth-user-pass-optional`, `auth-gen-token [LIFETIME]`,
+  `auth-gen-token-secret`. See [Authentication](#authentication).
 - Data channel: AES-256-GCM, AES-128-GCM, and CHACHA20-POLY1305, negotiated
   via `data-ciphers`; P_DATA_V2 with peer-id and client floating; 64-packet
   replay window.
@@ -162,21 +223,23 @@ softvpn doesn't implement are rejected at startup.
 
 - `tls-auth`, `tls-crypt`, and `tls-crypt-v2`: remove them from client profiles.
 - Compression (`compress`, `comp-lzo`): clients must not enable it.
-- `auth-user-pass` and plugins: authentication is by client certificate only.
+- Plugins and scripts (`plugin`, `auth-user-pass-verify`, `client-connect`,
+  ...): use the built-in user database instead. Deferred authentication,
+  `crl-verify DIR dir`, and `auth-gen-token`'s renewal window and
+  `external-auth` aren't supported.
 - IPv6 inside the tunnel, `iroute` (routing to networks behind a client),
   and CBC ciphers for pre-2.4 clients.
 - In TAP mode: a client bridging a LAN behind it (more than one MAC per
   client), IPv6, and VLAN tags.
-- Certificate revocation lists. To lock a client out, use `disable` in its
-  `client-config-dir` file.
 
 ## Layout
 
 | path | what |
 |---|---|
-| [cmd/softvpn](cmd/softvpn/main.go) | CLI: `server`, `pki init/client/profile` |
+| [cmd/softvpn](cmd/softvpn/main.go) | CLI: `server`, `pki init/client/profile/revoke/crl/list`, `user add/passwd/del/list` |
 | [internal/ovpn](internal/ovpn) | OpenVPN protocol: packets, reliability layer, TLS-over-control-channel, key exchange, data-channel crypto, UDP/TCP transports |
 | [internal/server](internal/server) | config, address pool, virtual router, soft-NAT policy, ICMP NAT; TAP mode's virtual switch and DHCP server |
 | [internal/vnet](internal/vnet) | gVisor stack in promiscuous/spoofing mode, TCP/UDP forwarders (the NAT) |
-| [internal/pki](internal/pki) | minimal CA (easy-rsa replacement) and `.ovpn` profile generation |
+| [internal/pki](internal/pki) | minimal CA (easy-rsa replacement), CRL, and `.ovpn` profile generation |
+| [internal/users](internal/users) | user database for `auth-user-pass-file` (htpasswd-style bcrypt file) |
 | [internal/config](internal/config) | OpenVPN config syntax: directives, quoting, inline `<ca>` blocks, argv |

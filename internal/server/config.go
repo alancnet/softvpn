@@ -62,6 +62,7 @@ type Config struct {
 	StatusFile     string
 	StatusInterval time.Duration
 	Verb           int
+	Auth           AuthConfig
 
 	// TAP (bridged) mode: clients exchange Ethernet frames over a virtual
 	// switch; see bridge.go.
@@ -75,7 +76,10 @@ type Config struct {
 
 // Load validates directives and builds a server Config.
 func Load(c *config.Config) (*Config, error) {
-	if err := c.Check(append(directives, ignored...)...); err != nil {
+	if err := rejectScripts(c); err != nil {
+		return nil, err
+	}
+	if err := c.Check(append(append(directives, authDirectives...), ignored...)...); err != nil {
 		return nil, err
 	}
 	cfg := &Config{
@@ -254,6 +258,9 @@ func Load(c *config.Config) (*Config, error) {
 		return nil, err
 	}
 	if cfg.TLS, err = pki.ServerTLS(ca, cert, key); err != nil {
+		return nil, err
+	}
+	if cfg.Auth, err = loadAuth(c, ca, cfg.TLS); err != nil {
 		return nil, err
 	}
 	return cfg, nil

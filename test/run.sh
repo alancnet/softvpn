@@ -38,7 +38,7 @@ if ! out=$(dc up -d --build --quiet-pull 2>&1); then
 fi
 
 echo "==> waiting for the clients to finish connecting"
-for c in client1 client2 client3 tapclient1 tapclient2 tapclient3; do
+for c in client1 client2 client3 client4 tapclient1 tapclient2 tapclient3; do
   for _ in $(seq 1 30); do
     dc logs "$c" 2>/dev/null | grep -q "Initialization Sequence Completed" && break
     sleep 1
@@ -203,8 +203,60 @@ out=$(x tapclient3 curl -s -m 5 http://$WEB/ 2>&1)
 x tapclient3 ping -c 2 -W 2 10.10.0.1 >/dev/null 2>&1 && echo "$out" | grep -q "you are $DHCP_WAN" &&
   ok "tapclient3 pings the gateway and reaches web through NAT" || bad "DHCP client -> gateway and web" "$out"
 
+echo "==> username/password authentication (built-in user database)"
+c4ip=$(tunip client4)
+case "$c4ip" in 10.8.0.*) ok "client4 (no certificate, auth-user-pass) connected and got $c4ip" ;; *) bad "client4 (no certificate, auth-user-pass) connected" "tun0: $c4ip" ;; esac
+line=$(srvlog | grep 'user authenticated' | grep 'user=alice ')
+echo "$line" | grep -q 'method=password' && srvlog | grep 'client connected' | grep -q 'client=alice ' &&
+  ok "server checked alice's password and named the session alice (username-as-common-name)" || bad "password login as alice" "$line"
+out=$(x client4 curl -s -m 5 http://$WEB/ 2>&1)
+echo "$out" | grep -q "you are $SRV_WAN" && ok "client4 -> web through NAT" || bad "client4 -> web" "$out"
+for _ in $(seq 1 30); do srvlog | grep 'data channel rekeyed' | grep -q 'client=alice ' && break; sleep 1; done
+out=$(x client4 curl -s -m 5 http://$WEB/ 2>&1)
+if srvlog | grep 'data channel rekeyed' | grep -q 'client=alice ' && dc logs client4 2>/dev/null | grep -q 'TLS: soft reset' &&
+  ! dc logs client4 2>/dev/null | grep -q AUTH_FAILED && echo "$out" | grep -q "you are $SRV_WAN"; then
+  ok "client4 re-authenticated on renegotiation with its auth-token; traffic still flows"
+else
+  bad "client4 renegotiation with auth-token" "$out"
+fi
+for _ in $(seq 1 20); do dc logs client5 2>/dev/null | grep -q AUTH_FAILED && break; sleep 1; done
+if dc logs client5 2>/dev/null | grep -q AUTH_FAILED && ! dc logs client5 2>/dev/null | grep -q 'Initialization Sequence Completed'; then
+  ok "client5 (wrong password) got AUTH_FAILED"
+else
+  bad "client5 (wrong password) got AUTH_FAILED" "$(dc logs --no-log-prefix client5 2>&1 | tail -3)"
+fi
+line=$(srvlog | grep 'client rejected' | grep 'authentication failed for user')
+[ -n "$line" ] && ok "server logged the rejected login: ${line##*reason=}" || bad "server logged the rejected login"
+
+echo "==> certificate revocation (crl-verify)"
+for _ in $(seq 1 20); do srvlog | grep 'certificate revoked' | grep -q 'client=revoked ' && break; sleep 1; done
+if ! dc logs client6 2>/dev/null | grep -q 'Initialization Sequence Completed' && [ -z "$(tunip client6)" ]; then
+  ok "client6 (revoked certificate) cannot connect"
+else
+  bad "client6 (revoked certificate) cannot connect"
+fi
+line=$(srvlog | grep 'client certificate revoked, refusing' | grep 'client=revoked ' | head -1)
+[ -n "$line" ] && ok "server logged why: client certificate revoked (serial ${line##*serial=})" || bad "server logged the revoked certificate" "$(srvlog | grep -i revok | tail -2)"
+
+echo "==> live changes: revoke a connected client, delete a connected user"
+dc run --rm --no-deps pki pki revoke -dir /pki client3 >/dev/null 2>&1
+for _ in $(seq 1 15); do srvlog | grep -q 'disconnecting client: certificate revoked.*client=client3 ' && break; sleep 1; done
+srvlog | grep -q 'disconnecting client: certificate revoked.*client=client3 ' &&
+  ok "revoking client3's certificate disconnected it within seconds (CRL re-read)" || bad "revoking a connected client disconnects it" "$(srvlog | grep -i revok | tail -2)"
+for _ in $(seq 1 10); do dc logs client3 2>/dev/null | grep -q 'AUTH_FAILED,certificate revoked' && break; sleep 1; done
+dc logs client3 2>/dev/null | grep -q 'AUTH_FAILED,certificate revoked' &&
+  ok "client3 was told why (AUTH_FAILED,certificate revoked) and stopped" || bad "client3 told it was revoked" "$(dc logs --no-log-prefix client3 2>&1 | tail -3)"
+dc run --rm --no-deps pki user del -file /pki/users alice >/dev/null 2>&1
+for _ in $(seq 1 15); do srvlog | grep -q 'disconnecting client: user removed.*user=alice' && break; sleep 1; done
+srvlog | grep -q 'disconnecting client: user removed.*user=alice' &&
+  ok "deleting user alice disconnected client4 (users file re-read)" || bad "deleting a user disconnects them"
+for _ in $(seq 1 15); do dc logs client4 2>/dev/null | grep -q AUTH_FAILED && break; sleep 1; done
+dc logs client4 2>/dev/null | grep -q AUTH_FAILED &&
+  ok "client4 can no longer log in (AUTH_FAILED)" || bad "client4 AUTH_FAILED after user deletion" "$(dc logs --no-log-prefix client4 2>&1 | tail -3)"
+
 echo "==> server log"
-for svc in server tapserver dhcpserver; do
+dc logs --no-log-prefix server 2>/dev/null | grep -E 'connected|listening|authenticated|rejected|revoked|removed' | sed 's/^/    server: /'
+for svc in tapserver dhcpserver; do
   dc logs --no-log-prefix $svc 2>/dev/null | grep -E 'connected|listening|switch' | sed "s/^/    $svc: /"
 done
 
