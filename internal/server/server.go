@@ -35,10 +35,27 @@ type Server struct {
 
 	mu       sync.RWMutex
 	pool     *pool
-	byIP     map[netip.Addr]*ovpn.Session
+	routes   *routes
 	byCN     map[string]*ovpn.Session
-	sessions map[*ovpn.Session]netip.Addr
+	sessions map[*ovpn.Session]*peer
 	tokens   map[*ovpn.Session]string // auth-token to push at Connect
+}
+
+// peer is the router's view of a connected client: its addresses and the
+// networks behind it.
+type peer struct {
+	ip      netip.Addr
+	ip6     netip.Addr // invalid without server-ipv6
+	iroutes []netip.Prefix
+}
+
+// prefixes is every route that points at the client.
+func (p *peer) prefixes() []netip.Prefix {
+	ps := append([]netip.Prefix{netip.PrefixFrom(p.ip, 32)}, p.iroutes...)
+	if p.ip6.IsValid() {
+		ps = append(ps, netip.PrefixFrom(p.ip6, 128))
+	}
+	return ps
 }
 
 func New(cfg *Config, log *slog.Logger) (*Server, error) {
@@ -62,9 +79,9 @@ func New(cfg *Config, log *slog.Logger) (*Server, error) {
 		cfg:      cfg,
 		log:      log,
 		pool:     newPool(cfg.Subnet, cfg.Gateway, static),
-		byIP:     map[netip.Addr]*ovpn.Session{},
+		routes:   newRoutes(),
 		byCN:     map[string]*ovpn.Session{},
-		sessions: map[*ovpn.Session]netip.Addr{},
+		sessions: map[*ovpn.Session]*peer{},
 		tokens:   map[*ovpn.Session]string{},
 	}
 	if cfg.PoolStart.IsValid() {
@@ -83,11 +100,15 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	defer st.Close()
-	if err := st.EnableNAT(vnet.NATOptions{
+	nat := vnet.NATOptions{
 		Gateway: netip.PrefixFrom(s.cfg.Gateway, s.cfg.Subnet.Bits()),
 		Policy:  s.policy,
 		Log:     s.log,
-	}); err != nil {
+	}
+	if s.cfg.Subnet6.IsValid() {
+		nat.Gateway6 = netip.PrefixFrom(s.cfg.Gateway6, s.cfg.Subnet6.Bits())
+	}
+	if err := st.EnableNAT(nat); err != nil {
 		return err
 	}
 	s.stack = st
@@ -115,29 +136,36 @@ func (s *Server) Run(ctx context.Context) error {
 	for _, l := range s.cfg.Listeners {
 		switch l.Proto {
 		case "udp":
-			ua, err := net.ResolveUDPAddr("udp", l.Addr)
+			ua, err := net.ResolveUDPAddr(l.Network, l.Addr)
 			if err != nil {
 				return err
 			}
-			conn, err := net.ListenUDP("udp", ua)
+			conn, err := net.ListenUDP(l.Network, ua)
 			if err != nil {
 				return err
 			}
 			conn.SetReadBuffer(4 << 20)
 			conn.SetWriteBuffer(4 << 20)
-			s.log.Info("listening", "proto", "udp", "addr", conn.LocalAddr())
+			s.log.Info("listening", "proto", l.Network, "addr", conn.LocalAddr())
 			go func() { errc <- engine.ServeUDP(ctx, conn) }()
 		case "tcp":
-			ln, err := net.Listen("tcp", l.Addr)
+			ln, err := net.Listen(l.Network, l.Addr)
 			if err != nil {
 				return err
 			}
-			s.log.Info("listening", "proto", "tcp", "addr", ln.Addr())
+			s.log.Info("listening", "proto", l.Network, "addr", ln.Addr())
 			go func() { errc <- engine.ServeTCP(ctx, ln) }()
 		}
 	}
-	s.log.Info("virtual network up", "subnet", s.cfg.Subnet, "gateway", s.cfg.Gateway,
-		"client_to_client", s.cfg.ClientToClient, "upstream_dns", s.cfg.UpstreamDNS, "ciphers", strings.Join(s.cfg.Ciphers, ":"))
+	attrs := []any{"subnet", s.cfg.Subnet, "gateway", s.cfg.Gateway}
+	if s.cfg.Subnet6.IsValid() {
+		attrs = append(attrs, "subnet6", s.cfg.Subnet6, "gateway6", s.cfg.Gateway6)
+	}
+	if len(s.cfg.Routes) > 0 {
+		attrs = append(attrs, "routes", s.cfg.Routes)
+	}
+	s.log.Info("virtual network up", append(attrs,
+		"client_to_client", s.cfg.ClientToClient, "upstream_dns", s.cfg.UpstreamDNS, "ciphers", strings.Join(s.cfg.Ciphers, ":"))...)
 	if s.bridge != nil {
 		s.log.Info("virtual switch up (dev tap)", "gateway_mac", s.cfg.MAC.String(), "pool", s.pool.first.String()+"-"+s.pool.last.String(), "dhcp_only", s.cfg.DHCP)
 	}
@@ -195,8 +223,23 @@ func (s *Server) Connect(ss *ovpn.Session) (*ovpn.Assignment, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.byIP[ip] = ss
-	s.sessions[ss] = ip
+	ip6 := cc.IP6
+	if !ip6.IsValid() {
+		ip6 = s.cfg.ipv6For(ip)
+	}
+	if ip6.IsValid() {
+		if other := s.routes.hosts[ip6.Addr()]; other != nil && other != ss {
+			s.pool.release(ip)
+			return nil, fmt.Errorf("address %s is already in use", ip6.Addr())
+		}
+	}
+	p := &peer{ip: ip, ip6: ip6.Addr(), iroutes: cc.IRoutes}
+	for _, r := range p.prefixes() {
+		if prev := s.routes.add(r, ss); prev != nil && prev != ss {
+			s.log.Warn("iroute moved to another client", "route", r, "from", prev.CommonName(), "to", cn)
+		}
+	}
+	s.sessions[ss] = p
 	if !s.cfg.DuplicateCN {
 		s.byCN[cn] = ss
 	}
@@ -210,10 +253,12 @@ func (s *Server) Connect(ss *ovpn.Session) (*ovpn.Assignment, error) {
 		push = append(push, "auth-token "+token)
 	}
 	a := &ovpn.Assignment{
-		IP:      ip,
-		Netmask: net.IP(net.CIDRMask(s.cfg.Subnet.Bits(), 32)).String(),
-		Gateway: s.cfg.Gateway,
-		Push:    push,
+		IP:       ip,
+		Netmask:  net.IP(net.CIDRMask(s.cfg.Subnet.Bits(), 32)).String(),
+		Gateway:  s.cfg.Gateway,
+		IP6:      ip6,
+		Gateway6: s.cfg.Gateway6,
+		Push:     withoutOwnRoutes(push, cc.IRoutes),
 	}
 	if s.bridge != nil {
 		s.bridge.attach(ss, ip, push)
@@ -225,15 +270,65 @@ func (s *Server) Connect(ss *ovpn.Session) (*ovpn.Assignment, error) {
 	return a, nil
 }
 
+// withoutOwnRoutes drops pushed "route"/"route-ipv6" options for networks
+// that are behind the client itself (its iroutes), as OpenVPN does: they
+// would point the client's own LAN back into the tunnel.
+func withoutOwnRoutes(push []string, iroutes []netip.Prefix) []string {
+	if len(iroutes) == 0 {
+		return push
+	}
+	var out []string
+	for _, o := range push {
+		if r, ok := pushedRoute(o); ok && covers(iroutes, r) {
+			continue
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
+// pushedRoute parses a pushed "route NETWORK [NETMASK ...]" or "route-ipv6
+// PREFIX ..." option.
+func pushedRoute(opt string) (netip.Prefix, bool) {
+	f := strings.Fields(opt)
+	var r netip.Prefix
+	var err error
+	switch {
+	case len(f) == 2 && f[0] == "route":
+		r, err = parseRoute4(f[1], "")
+	case len(f) > 2 && f[0] == "route":
+		r, err = parseRoute4(f[1], f[2])
+	case len(f) >= 2 && f[0] == "route-ipv6":
+		r, err = parseRoute6(f[1])
+	default:
+		return r, false
+	}
+	return r, err == nil
+}
+
+// covers reports whether r lies entirely within one of nets.
+func covers(nets []netip.Prefix, r netip.Prefix) bool {
+	for _, n := range nets {
+		if n.Bits() <= r.Bits() && n.Contains(r.Addr()) {
+			return true
+		}
+	}
+	return false
+}
+
 // Disconnect implements ovpn.Handler.
 func (s *Server) Disconnect(ss *ovpn.Session, reason string) {
 	s.mu.Lock()
-	ip, ok := s.sessions[ss]
+	p, ok := s.sessions[ss]
+	var ip netip.Addr
 	if ok {
+		ip = p.ip
 		delete(s.sessions, ss)
-		if s.byIP[ip] == ss {
-			delete(s.byIP, ip)
+		if s.routes.hosts[ip] == ss {
 			s.pool.release(ip)
+		}
+		for _, r := range p.prefixes() {
+			s.routes.remove(r, ss)
 		}
 		if s.byCN[ss.CommonName()] == ss {
 			delete(s.byCN, ss.CommonName())
@@ -254,46 +349,53 @@ func (s *Server) Packet(ss *ovpn.Session, pkt []byte) {
 		s.bridge.input(ss, pkt) // an Ethernet frame
 		return
 	}
-	if len(pkt) < 20 || pkt[0]>>4 != 4 {
-		return // IPv4 only
+	h, ok := parseIP(pkt)
+	if !ok || h.dst.IsMulticast() {
+		return // includes IPv6 router solicitations and MLD from the tun
 	}
-	src := netip.AddrFrom4([4]byte(pkt[12:16]))
-	dst := netip.AddrFrom4([4]byte(pkt[16:20]))
 	s.mu.RLock()
-	assigned := s.sessions[ss]
+	from, to := s.routes.lookup(h.src), s.routes.lookup(h.dst)
 	s.mu.RUnlock()
-	if src != assigned {
-		s.log.Debug("dropping packet with spoofed source", "client", ss.CommonName(), "src", src, "assigned", assigned)
+	// Source validation: the client's own addresses or a network behind it.
+	if from != ss {
+		if !h.src.IsLinkLocalUnicast() {
+			s.log.Debug("dropping packet with spoofed source", "client", ss.CommonName(), "src", h.src)
+		}
 		return
 	}
 	switch {
-	case dst == s.cfg.Gateway:
+	case h.dst == s.cfg.Gateway || h.dst == s.cfg.Gateway6 && h.dst.IsValid():
 		s.stack.Inject(pkt)
-	case s.cfg.Subnet.Contains(dst):
+	case to != nil && to != ss: // another client, or a network behind one
 		if s.cfg.ClientToClient {
-			s.deliver(pkt)
+			to.SendPacket(pkt)
 		}
-	case pkt[9] == 1: // ICMP
-		if _, ok := s.policy("icmp", netip.AddrPort{}, netip.AddrPortFrom(dst, 0)); ok {
-			s.pinger.forward(pkt)
+	case s.cfg.internal(h.dst):
+		// Inside the VPN but nobody serves it (yet): unreachable.
+	case h.dst.Is4() && h.proto == protoICMP || h.isEcho6(pkt):
+		// Other ICMPv6 (e.g. packet too big for a NATed flow) goes to the
+		// stack below.
+		if _, ok := s.policy("icmp", netip.AddrPort{}, netip.AddrPortFrom(h.dst, 0)); ok {
+			s.pinger.forward(h, pkt)
 		}
 	default:
 		s.stack.Inject(pkt)
 	}
 }
 
-// deliver sends a packet to the client that owns its destination address.
+// deliver sends a packet to the client that owns its destination address
+// (or the network behind a client that it belongs to).
 func (s *Server) deliver(pkt []byte) {
 	if s.bridge != nil {
 		s.bridge.output(pkt)
 		return
 	}
-	if len(pkt) < 20 {
+	h, ok := parseIP(pkt)
+	if !ok {
 		return
 	}
-	dst := netip.AddrFrom4([4]byte(pkt[16:20]))
 	s.mu.RLock()
-	peer := s.byIP[dst]
+	peer := s.routes.lookup(h.dst)
 	s.mu.RUnlock()
 	if peer != nil {
 		peer.SendPacket(pkt)
@@ -305,13 +407,15 @@ func (s *Server) deliver(pkt []byte) {
 // the host's resolver.
 func (s *Server) policy(network string, src, dst netip.AddrPort) (string, bool) {
 	a := dst.Addr()
-	if a == s.cfg.Gateway {
+	if a == s.cfg.Gateway || a == s.cfg.Gateway6 && a.IsValid() {
 		if dst.Port() == 53 && s.cfg.UpstreamDNS != "" {
 			return s.cfg.UpstreamDNS, true
 		}
 		return "", false
 	}
-	if s.cfg.Subnet.Contains(a) || a.IsLoopback() || a.IsUnspecified() || a.IsMulticast() ||
+	// IPv4-mapped IPv6 addresses would let a client reach IPv4 (including
+	// the host's loopback) under an IPv6 name, so they are refused outright.
+	if s.cfg.internal(a) || a.IsLoopback() || a.IsUnspecified() || a.IsMulticast() || a.Is4In6() ||
 		a == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
 		return "", false
 	}
@@ -328,7 +432,7 @@ func (s *Server) policy(network string, src, dst netip.AddrPort) (string, bool) 
 		}
 		return "", false
 	}
-	if linkLocal.Contains(a) {
+	if linkLocal.Contains(a) || a.Is6() && a.IsLinkLocalUnicast() {
 		return "", false
 	}
 	return dst.String(), true
@@ -350,21 +454,30 @@ func (s *Server) statusLoop(ctx context.Context) {
 func (s *Server) writeStatus() {
 	type row struct {
 		ss *ovpn.Session
-		ip netip.Addr
+		p  peer
 	}
 	s.mu.RLock()
 	rows := make([]row, 0, len(s.sessions))
-	for ss, ip := range s.sessions {
-		rows = append(rows, row{ss, ip})
+	for ss, p := range s.sessions {
+		rows = append(rows, row{ss, *p})
 	}
 	s.mu.RUnlock()
-	sort.Slice(rows, func(i, j int) bool { return rows[i].ip.Less(rows[j].ip) })
+	sort.Slice(rows, func(i, j int) bool { return rows[i].p.ip.Less(rows[j].p.ip) })
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "softvpn status %s\n", time.Now().UTC().Format(time.RFC3339))
-	fmt.Fprintf(&b, "%-24s %-15s %-28s %12s %12s\n", "COMMON NAME", "VIRTUAL IP", "REAL ADDRESS", "RX BYTES", "TX BYTES")
+	v6 := s.cfg.Subnet6.IsValid()
+	fmt.Fprintf(&b, "%-24s %-15s %-28s %12s %12s", "COMMON NAME", "VIRTUAL IP", "REAL ADDRESS", "RX BYTES", "TX BYTES")
+	if v6 {
+		fmt.Fprintf(&b, " %s", "VIRTUAL IPV6")
+	}
+	b.WriteString("\n")
 	for _, r := range rows {
-		fmt.Fprintf(&b, "%-24s %-15s %-28s %12d %12d\n", r.ss.CommonName(), r.ip, r.ss.Remote(), r.ss.RxBytes.Load(), r.ss.TxBytes.Load())
+		fmt.Fprintf(&b, "%-24s %-15s %-28s %12d %12d", r.ss.CommonName(), r.p.ip, r.ss.Remote(), r.ss.RxBytes.Load(), r.ss.TxBytes.Load())
+		if v6 {
+			fmt.Fprintf(&b, " %s", r.p.ip6)
+		}
+		b.WriteString("\n")
 	}
 	tmp := s.cfg.StatusFile + ".tmp"
 	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err == nil {

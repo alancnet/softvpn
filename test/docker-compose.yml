@@ -1,20 +1,28 @@
 # softvpn end-to-end test.
 #
-#   wan     (${SVT_NET}.10.0/24, has internet)  server  tapserver  dhcpserver  web
-#   edge    (${SVT_NET}.20.0/24, internal: no route anywhere)  server  clients  probe
+#   wan     (${SVT_NET}.10.0/24, ${SVT_NET6}:10::/64, has internet)
+#           server  tapserver  dhcpserver  web
+#   edge    (${SVT_NET}.20.0/24, ${SVT_NET6}:20::/64, internal: no route anywhere)
+#           server  clients  probe
 #   tapedge (${SVT_NET}.30.0/24, internal)  tapserver  tapclient1  tapclient2
 #   dhcpedge (${SVT_NET}.40.0/24, internal)  dhcpserver  tapclient3
+#   lan     (${SVT_NET}.50.0/24, ${SVT_NET6}:50::/64, internal)  siteclient  lansvc
 #
 # tapserver and dhcpserver are softvpn in TAP (bridged) mode. Each answers
 # to the name "server" on its own edge network, so the generated client
 # profiles work unchanged; the TAP clients only add --dev tap.
 #
-# SVT_ID / SVT_NET (set by run.sh) keep parallel runs apart: project name,
-# image tags and subnets all derive from them.
+# SVT_ID / SVT_NET / SVT_NET6 / SVT_CCD (set by run.sh) keep parallel runs
+# apart: project name, image tags and subnets all derive from them.
 #
 # The clients only sit on "edge", which Docker keeps isolated, so anything they
 # reach on "wan" or the internet must have gone through the VPN and been
-# NATed in software by the server.
+# NATed in software by the server. Inside the tunnel the (tun) clients get
+# IPv4 (10.8.0.0/24) and IPv6 (fd00:8::/64) addresses.
+#
+# "lan" is a private network behind siteclient, a site gateway: the server
+# routes it to siteclient (iroute in its client-config-dir file), and other
+# clients reach lansvc on it through the VPN without any NAT.
 #
 # tlsauth-server, tlscrypt-server and tlscryptv2-server are the same server
 # with each kind of control-channel protection, for the tls*-client clients.
@@ -33,12 +41,18 @@ x-locked-down: &locked-down
 
 networks:
   wan:
+    enable_ipv6: true
     ipam:
-      config: [{ subnet: "${SVT_NET:-10.231}.10.0/24" }]
+      config:
+        - subnet: "${SVT_NET:-10.231}.10.0/24"
+        - subnet: "${SVT_NET6:-fd00:231}:10::/64"
   edge:
     internal: true
+    enable_ipv6: true
     ipam:
-      config: [{ subnet: "${SVT_NET:-10.231}.20.0/24" }]
+      config:
+        - subnet: "${SVT_NET:-10.231}.20.0/24"
+        - subnet: "${SVT_NET6:-fd00:231}:20::/64"
   tapedge:
     internal: true
     ipam:
@@ -47,6 +61,13 @@ networks:
     internal: true
     ipam:
       config: [{ subnet: "${SVT_NET:-10.231}.40.0/24" }]
+  lan:
+    internal: true
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: "${SVT_NET:-10.231}.50.0/24"
+        - subnet: "${SVT_NET6:-fd00:231}:50::/64"
 
 volumes:
   pki:
@@ -62,7 +83,7 @@ services:
     network_mode: none
     volumes: [pki:/pki]
     # -shared: clients run as a different uid; demo volume only.
-    command: [pki, init, -dir, /pki, -clients, "client1,client2,client3,revoked,tapclient1,tapclient2,tapclient3", -remote, server, -shared]
+    command: [pki, init, -dir, /pki, -clients, "client1,client2,client3,siteclient,revoked,tapclient1,tapclient2,tapclient3", -remote, server, -shared]
 
   # The image has no shell, so each further setup step is its own one-shot
   # container: revoke a certificate (writes /pki/crl.pem, which the server
@@ -114,19 +135,39 @@ services:
     user: "65534:65534"
     depends_on:
       users: { condition: service_completed_successfully }
-    command: [server, --config, /etc/softvpn/server.conf]
+    # siteclient's LAN is inside the VPN (route, route-ipv6) and every client
+    # is told to reach it through the tunnel (push). siteclient itself is
+    # not: the server leaves out pushed routes to a client's own iroutes.
+    command:
+      - server
+      - --config
+      - /etc/softvpn/server.conf
+      - --route
+      - "${SVT_NET:-10.231}.50.0"
+      - 255.255.255.0
+      - --route-ipv6
+      - "${SVT_NET6:-fd00:231}:50::/64"
+      - --push
+      - "route ${SVT_NET:-10.231}.50.0 255.255.255.0"
+      - --push
+      - "route-ipv6 ${SVT_NET6:-fd00:231}:50::/64"
     volumes:
       - pki:/pki:ro
       - ./server.conf:/etc/softvpn/server.conf:ro
-      - ./ccd:/etc/softvpn/ccd:ro
+      - ${SVT_CCD:-./ccd}:/etc/softvpn/ccd:ro
     tmpfs: ["/tmp:uid=65534,gid=65534"]
     networks:
-      wan: { ipv4_address: "${SVT_NET:-10.231}.10.100" }
-      edge: { ipv4_address: "${SVT_NET:-10.231}.20.100" }
+      wan:
+        ipv4_address: "${SVT_NET:-10.231}.10.100"
+        ipv6_address: "${SVT_NET6:-fd00:231}:10::100"
+      edge:
+        ipv4_address: "${SVT_NET:-10.231}.20.100"
+        ipv6_address: "${SVT_NET6:-fd00:231}:20::100"
 
   # TAP mode: a virtual Ethernet switch with a server-bridge address pool.
   tapserver:
     <<: *server
+    command: [server, --config, /etc/softvpn/server.conf]
     volumes:
       - pki:/pki:ro
       - ./server-tap.conf:/etc/softvpn/server.conf:ro
@@ -137,6 +178,7 @@ services:
   # TAP mode with "server-bridge" and no pool: clients use DHCP.
   dhcpserver:
     <<: *server
+    command: [server, --config, /etc/softvpn/server.conf]
     volumes:
       - pki:/pki:ro
       - ./server-dhcp.conf:/etc/softvpn/server.conf:ro
@@ -179,7 +221,9 @@ services:
     user: "65534:65534"
     command: [web.sh]
     networks:
-      wan: { ipv4_address: "${SVT_NET:-10.231}.10.10" }
+      wan:
+        ipv4_address: "${SVT_NET:-10.231}.10.10"
+        ipv6_address: "${SVT_NET6:-fd00:231}:10::10"
 
   client1:
     &client
@@ -198,7 +242,7 @@ services:
     command: [client-entrypoint.sh, --config, /pki/client1.ovpn, --reneg-sec, "15"]
     networks: [edge]
 
-  # Same client over TCP, with a static address from client-config-dir and a
+  # Same client over TCP, with static addresses from client-config-dir and a
   # small HTTP service that client1 reaches via client-to-client routing.
   client2:
     <<: *client
@@ -206,13 +250,52 @@ services:
     environment: { SERVE_PORT: "8080" }
 
   # An older OpenVPN (2.5.10): no tls-ekm, so keys come from OpenVPN's legacy
-  # PRF; and it only offers ChaCha20-Poly1305.
+  # PRF; it only offers ChaCha20-Poly1305; and it reaches the server over
+  # IPv6 (udp6).
   client3:
     &client25
     <<: *client
     build: { context: ./tools, args: { ALPINE: "3.17" } }
     image: softvpn-test-tools${SVT_ID:-}:openvpn-2.5
-    command: [client-entrypoint.sh, --config, /pki/client3.ovpn, --data-ciphers, CHACHA20-POLY1305]
+    command: [client-entrypoint.sh, --config, /pki/client3.ovpn, --data-ciphers, CHACHA20-POLY1305, --proto, udp6]
+
+  # A site gateway: an ordinary client that also sits on "lan" and forwards
+  # between it and the tunnel. Forwarding is a per-network-namespace sysctl,
+  # which Docker sets without any extra privilege.
+  siteclient:
+    <<: *client
+    command: [client-entrypoint.sh, --config, /pki/siteclient.ovpn]
+    sysctls:
+      net.ipv4.ip_forward: 1
+      net.ipv6.conf.all.forwarding: 1
+    networks:
+      edge: {}
+      lan:
+        ipv4_address: "${SVT_NET:-10.231}.50.4"
+        ipv6_address: "${SVT_NET6:-fd00:231}:50::4"
+
+  # A host on siteclient's LAN. As on a real LAN, it needs a route back to
+  # the VPN subnets via the site gateway (siteclient); that is the only
+  # reason it gets NET_ADMIN. No NAT anywhere, so it sees the VPN clients'
+  # own addresses.
+  lansvc:
+    image: softvpn-test-tools${SVT_ID:-}
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    security_opt: ["no-new-privileges:true"]
+    depends_on: [siteclient]
+    command:
+      - sh
+      - -c
+      - >-
+        ip route add 10.8.0.0/24 via ${SVT_NET:-10.231}.50.4 &&
+        ip -6 route add fd00:8::/64 via ${SVT_NET6:-fd00:231}:50::4 &&
+        exec web.sh
+    networks:
+      lan:
+        ipv4_address: "${SVT_NET:-10.231}.50.10"
+        ipv6_address: "${SVT_NET6:-fd00:231}:50::10"
 
   # No certificate: username and password only (verify-client-cert optional
   # on the server), authenticating as alice. Renegotiates every 15s, which

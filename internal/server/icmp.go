@@ -11,20 +11,22 @@ import (
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
-// pinger NATs ICMP echo requests using unprivileged ICMP sockets
-// (SOCK_DGRAM/IPPROTO_ICMP). These need no capability, only a gid within
-// net.ipv4.ping_group_range, which Docker opens to every group by default.
-// Each (client, destination, echo id) flow gets its own socket; the kernel
-// rewrites the echo id, and replies are mapped back to the client's id.
+// pinger NATs ICMP and ICMPv6 echo requests using unprivileged ping sockets
+// (SOCK_DGRAM/IPPROTO_ICMP and IPPROTO_ICMPV6). These need no capability,
+// only a gid within net.ipv4.ping_group_range (which covers both families),
+// and Docker opens it to every group by default. Each (client, destination,
+// echo id) flow gets its own socket; the kernel rewrites the echo id, and
+// replies are mapped back to the client's id.
 type pinger struct {
 	log     *slog.Logger
 	deliver func([]byte)
 
 	mu       sync.Mutex
 	flows    map[pingKey]*pingFlow
-	disabled atomic.Bool
+	disabled [2]atomic.Bool // per family: [0] IPv4, [1] IPv6
 }
 
 type pingKey struct {
@@ -43,30 +45,34 @@ func newPinger(log *slog.Logger, deliver func([]byte)) *pinger {
 	return &pinger{log: log, deliver: deliver, flows: map[pingKey]*pingFlow{}}
 }
 
-func (p *pinger) forward(pkt []byte) {
-	if p.disabled.Load() {
+// forward sends the echo request pkt (with parsed header h) on its way.
+func (p *pinger) forward(h ipHeader, pkt []byte) {
+	v6 := h.dst.Is6()
+	fam, network, laddr, typ := 0, "udp4", "0.0.0.0", byte(icmpEchoRequest)
+	var echo icmp.Type = ipv4.ICMPTypeEcho
+	if v6 {
+		fam, network, laddr, typ = 1, "udp6", "::", icmpv6EchoRequest
+		echo = ipv6.ICMPTypeEchoRequest
+	}
+	if p.disabled[fam].Load() {
 		return
 	}
-	ihl := int(pkt[0]&0x0f) * 4
-	if len(pkt) < ihl+8 || pkt[ihl] != byte(ipv4.ICMPTypeEcho) || pkt[ihl+1] != 0 {
+	icmpData := pkt[h.payload:]
+	if len(icmpData) < 8 || icmpData[0] != typ || icmpData[1] != 0 {
 		return // only echo requests are forwarded
 	}
-	key := pingKey{
-		client: netip.AddrFrom4([4]byte(pkt[12:16])),
-		dst:    netip.AddrFrom4([4]byte(pkt[16:20])),
-		id:     binary.BigEndian.Uint16(pkt[ihl+4:]),
-	}
-	seq := binary.BigEndian.Uint16(pkt[ihl+6:])
-	data := pkt[ihl+8:]
+	key := pingKey{client: h.src, dst: h.dst, id: binary.BigEndian.Uint16(icmpData[4:])}
+	seq := binary.BigEndian.Uint16(icmpData[6:])
+	data := icmpData[8:]
 
 	p.mu.Lock()
 	f := p.flows[key]
 	if f == nil {
-		conn, err := icmp.ListenPacket("udp4", "0.0.0.0")
+		conn, err := icmp.ListenPacket(network, laddr)
 		if err != nil {
 			p.mu.Unlock()
-			p.log.Warn("ICMP forwarding unavailable (unprivileged ping sockets not permitted; check net.ipv4.ping_group_range)", "err", err)
-			p.disabled.Store(true)
+			p.log.Warn("ICMP forwarding unavailable (unprivileged ping sockets not permitted; check net.ipv4.ping_group_range)", "family", network, "err", err)
+			p.disabled[fam].Store(true)
 			return
 		}
 		f = &pingFlow{conn: conn}
@@ -76,7 +82,9 @@ func (p *pinger) forward(pkt []byte) {
 	p.mu.Unlock()
 	f.last.Store(time.Now().UnixNano())
 
-	msg := icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: int(key.id), Seq: int(seq), Data: data}}
+	// The kernel fills in the checksum (for ICMPv6 it needs the pseudo
+	// header, which only it knows the source address for).
+	msg := icmp.Message{Type: echo, Body: &icmp.Echo{ID: int(key.id), Seq: int(seq), Data: data}}
 	b, err := msg.Marshal(nil)
 	if err != nil {
 		return
@@ -104,20 +112,31 @@ func (p *pinger) readReplies(key pingKey, f *pingFlow) {
 			}
 			return
 		}
-		m, err := icmp.ParseMessage(1, buf[:n])
-		if err != nil || m.Type != ipv4.ICMPTypeEchoReply {
+		proto, want := protoICMP, icmp.Type(ipv4.ICMPTypeEchoReply)
+		if key.dst.Is6() {
+			proto, want = protoICMPv6, ipv6.ICMPTypeEchoReply
+		}
+		m, err := icmp.ParseMessage(proto, buf[:n])
+		if err != nil || m.Type != want {
 			continue
 		}
 		echo, ok := m.Body.(*icmp.Echo)
 		if !ok {
 			continue
 		}
-		reply := icmp.Message{Type: ipv4.ICMPTypeEchoReply, Body: &icmp.Echo{ID: int(key.id), Seq: echo.Seq, Data: echo.Data}}
+		reply := icmp.Message{Type: want, Body: &icmp.Echo{ID: int(key.id), Seq: echo.Seq, Data: echo.Data}}
+		if key.dst.Is6() {
+			body, err := reply.Marshal(icmp.IPv6PseudoHeader(key.dst.AsSlice(), key.client.AsSlice()))
+			if err == nil {
+				p.deliver(ipv6Packet(key.dst, key.client, protoICMPv6, body))
+			}
+			continue
+		}
 		body, err := reply.Marshal(nil)
 		if err != nil {
 			continue
 		}
-		p.deliver(ipv4Packet(key.dst, key.client, 1, body))
+		p.deliver(ipv4Packet(key.dst, key.client, protoICMP, body))
 	}
 }
 
@@ -133,6 +152,20 @@ func ipv4Packet(src, dst netip.Addr, proto byte, payload []byte) []byte {
 	copy(b[16:20], d4[:])
 	binary.BigEndian.PutUint16(b[10:], checksum(b[:20]))
 	copy(b[20:], payload)
+	return b
+}
+
+// ipv6Packet wraps payload in a minimal IPv6 header.
+func ipv6Packet(src, dst netip.Addr, proto byte, payload []byte) []byte {
+	b := make([]byte, 40+len(payload))
+	b[0] = 0x60
+	binary.BigEndian.PutUint16(b[4:], uint16(len(payload)))
+	b[6] = proto
+	b[7] = 64 // hop limit
+	s16, d16 := src.As16(), dst.As16()
+	copy(b[8:24], s16[:])
+	copy(b[24:40], d16[:])
+	copy(b[40:], payload)
 	return b
 }
 

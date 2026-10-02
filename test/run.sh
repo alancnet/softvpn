@@ -6,10 +6,24 @@
 #
 # Parallel runs (e.g. in several worktrees) must not share names or subnets:
 #   SVT_ID=-2 SVT_NET=10.232 test/run.sh
+# The IPv6 subnets follow SVT_NET (10.232 -> fd00:232::/48) unless SVT_NET6
+# is set.
 set -uo pipefail
 cd "$(dirname "$0")"
 export SVT_ID=${SVT_ID:-} SVT_NET=${SVT_NET:-10.231}
+export SVT_NET6=${SVT_NET6:-fd00:${SVT_NET##*.}}
 WEB=$SVT_NET.10.10 SRV_WAN=$SVT_NET.10.100 TAP_WAN=$SVT_NET.10.101 DHCP_WAN=$SVT_NET.10.102
+WEB6=$SVT_NET6:10::10 SRV_WAN6=$SVT_NET6:10::100
+LANSVC=$SVT_NET.50.10 LANSVC6=$SVT_NET6:50::10
+
+# The client-config-dir files name subnets that follow SVT_NET/SVT_NET6.
+# They are written for the defaults; render a copy for this run.
+SVT_CCD=$(mktemp -d)
+export SVT_CCD
+for f in ccd/*; do
+  sed -e "s/10\.231\./$SVT_NET./g" -e "s/fd00:231:/$SVT_NET6:/g" "$f" >"$SVT_CCD/${f##*/}"
+done
+chmod 755 "$SVT_CCD" && chmod 644 "$SVT_CCD"/*
 
 dc() { docker compose "$@"; }
 pass=0 fail=0 warn=0
@@ -19,10 +33,19 @@ soft() { printf '  \033[33mWARN\033[0m %s\n' "$1"; warn=$((warn + 1)); }
 # check NAME CMD...: pass if CMD succeeds
 check() { local name=$1; shift; local out; if out=$("$@" 2>&1); then ok "$name"; else bad "$name" "$(echo "$out" | tail -3)"; fi; }
 x() { local svc=$1; shift; dc exec -T "$svc" "$@"; }
+# socat reports IPv6 peers in full: [fd00:0008:0000:0000:0000:0000:0000:1001]
+full6() {
+  local head=${1%%::*} tail= groups=() g
+  [[ $1 == *::* ]] && tail=${1#*::}
+  IFS=: read -ra h <<<"$head"; IFS=: read -ra t <<<"$tail"
+  groups=("${h[@]}"); for ((g = ${#h[@]} + ${#t[@]}; g < 8; g++)); do groups+=(0); done; groups+=("${t[@]}")
+  printf '[%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x]' $(printf '0x%s ' "${groups[@]}")
+}
 
 cleanup() {
   if [ -z "${KEEP:-}" ]; then
     dc down -v --remove-orphans >/dev/null 2>&1
+    rm -rf "$SVT_CCD"
   else
     echo "KEEP=1: environment left running (docker compose -f test/docker-compose.yml down -v to remove)"
   fi
@@ -38,7 +61,7 @@ if ! out=$(dc up -d --build --quiet-pull 2>&1); then
 fi
 
 echo "==> waiting for the clients to finish connecting"
-for c in client1 client2 client3 client4 tapclient1 tapclient2 tapclient3 \
+for c in client1 client2 client3 client4 siteclient tapclient1 tapclient2 tapclient3 \
     tlsauth-client tlscrypt-client tlscryptv2-client tlscryptv2-client25; do
   for _ in $(seq 1 30); do
     dc logs "$c" 2>/dev/null | grep -q "Initialization Sequence Completed" && break
@@ -47,7 +70,7 @@ for c in client1 client2 client3 client4 tapclient1 tapclient2 tapclient3 \
 done
 
 echo "==> container privileges"
-for svc in server client1 client2 client3; do
+for svc in server client1 client2 client3 siteclient; do
   id=$(dc ps -q "$svc")
   [ -n "$id" ] || { bad "$svc is running"; continue; }
   priv=$(docker inspect -f '{{.HostConfig.Privileged}}' "$id")
@@ -136,6 +159,58 @@ if [ "$n" -ge 2 ] && dc logs client1 2>/dev/null | grep -q 'TLS: soft reset'; th
   echo "$out" | grep -q "you are $SRV_WAN" && ok "traffic still flows after $n client-initiated key renegotiations" || bad "traffic after renegotiation" "$out"
 else
   bad "client1 renegotiated keys" "server saw $n rekeys"
+fi
+
+echo "==> IPv6 inside the tunnel"
+tunip6() { x "$1" ip -6 -o addr show dev tun0 scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1; }
+c1ip6=$(tunip6 client1)
+want=$(printf 'fd00:8::%x' $((0x1000 + ${c1ip##*.} - 2)))
+[ "$c1ip6" = "$want" ] && ok "client1 got $c1ip6 from server-ipv6 (pool address matching its IPv4 $c1ip)" || bad "client1 IPv6 pool address" "tun0: '$c1ip6', expected $want"
+check "client2 got static fd00:8::20 from ifconfig-ipv6-push" sh -c "docker compose exec -T client2 ip -6 addr show tun0 | grep -q 'inet6 fd00:8::20/64'"
+check "client1 pings the server's virtual IPv6 address fd00:8::1 (gVisor)" x client1 ping -6 -c 3 -W 2 fd00:8::1
+check "redirect-gateway ipv6: client1 routes IPv6 web traffic via tun0" sh -c "docker compose exec -T client1 ip -6 route get $WEB6 | grep -q 'dev tun0'"
+if x probe curl -s -m 3 "http://[$WEB6]/" >/dev/null 2>&1; then
+  bad "probe cannot reach web over IPv6 without VPN" "edge network is not isolated, test is meaningless"
+else
+  ok "probe cannot reach web ($WEB6) over IPv6 without the VPN"
+fi
+out=$(x client1 curl -s -m 5 "http://[$WEB6]/" 2>&1)
+echo "$out" | grep -qF "you are $(full6 $SRV_WAN6)" && ok "IPv6 TCP NAT: client1 -> web; web saw the server's IPv6 address: ${out##*you are }" || bad "IPv6 TCP NAT to web" "$out"
+out=$(x client1 sh -c "echo udp6-echo-test | socat -t 2 - UDP6:[$WEB6]:7" 2>&1)
+[ "$out" = udp6-echo-test ] && ok "IPv6 UDP NAT: echo service answered" || bad "IPv6 UDP NAT echo" "$out"
+check "ICMPv6 NAT: client1 pings web over IPv6 (unprivileged ICMPv6 ping socket on server)" x client1 ping -6 -c 3 -W 2 "$WEB6"
+out=$(x client1 dig +short +time=2 +tries=2 @fd00:8::1 web AAAA 2>&1)
+[ "$out" = "$WEB6" ] && ok "DNS via fd00:8::1 over IPv6 (web AAAA -> $out)" || bad "DNS via the IPv6 gateway" "$out"
+out=$(x client1 curl -s -m 5 "http://[fd00:8::20]:8080/" 2>&1)
+echo "$out" | grep -qF "you are $(full6 $c1ip6)" && ok "client1 -> client2 (fd00:8::20) over IPv6 client-to-client: $out" || bad "IPv6 client-to-client" "$out"
+line=$(srvlog | grep 'client connected' | grep 'client=client3 ')
+echo "$line" | grep -q "remote=udp:\[$SVT_NET6:20::" && echo "$line" | grep -q 'ip6=fd00:8::' &&
+  ok "client3 (OpenVPN 2.5) connected to the server over IPv6 (udp6) and got IPv6 in the tunnel" || bad "client3 over udp6 with IPv6 in the tunnel" "$line"
+out=$(x client3 curl -s -m 5 "http://[$WEB6]/" 2>&1)
+echo "$out" | grep -qF "you are $(full6 $SRV_WAN6)" && ok "client3 (OpenVPN 2.5) -> web over IPv6 through NAT" || bad "client3 -> web over IPv6" "$out"
+
+echo "==> iroute: siteclient's LAN behind the VPN (lansvc $LANSVC, $LANSVC6)"
+pushed() { dc logs --no-log-prefix "$1" 2>/dev/null | grep 'PUSH: Received control message'; }
+if pushed client1 | grep -q "route $SVT_NET.50.0 255.255.255.0" && pushed client1 | grep -q "route-ipv6 $SVT_NET6:50::/64" &&
+  ! pushed siteclient | grep -q "route $SVT_NET.50.0" && ! pushed siteclient | grep -q "route-ipv6 $SVT_NET6:50::"; then
+  ok "LAN routes pushed to client1 but not to siteclient, whose iroutes they are"
+else
+  bad "LAN routes pushed to everyone except the iroute owner" "siteclient: $(pushed siteclient | tail -1)"
+fi
+out=$(x client1 curl -s -m 5 "http://$LANSVC/" 2>&1)
+echo "$out" | grep -q "hello from .*, you are $c1ip\$" && ok "client1 -> lansvc via siteclient's iroute, not NATed (lansvc saw $c1ip)" || bad "client1 -> lansvc over iroute" "$out"
+check "client1 pings lansvc behind siteclient" x client1 ping -c 3 -W 2 "$LANSVC"
+out=$(x client1 curl -s -m 5 "http://[$LANSVC6]/" 2>&1)
+echo "$out" | grep -qF "you are $(full6 $c1ip6)" && ok "client1 -> lansvc over IPv6 via iroute-ipv6 (lansvc saw $c1ip6)" || bad "client1 -> lansvc over iroute-ipv6" "$out"
+out=$(x client2 curl -s -m 5 "http://$LANSVC/" 2>&1)
+echo "$out" | grep -q "you are 10.8.0.20\$" && ok "client2 (TCP) -> lansvc via iroute" || bad "client2 -> lansvc over iroute" "$out"
+
+echo "==> real IPv6 internet via the server (optional)"
+ip6=$(x client1 dig +short +time=3 +tries=1 @10.8.0.1 example.com AAAA 2>/dev/null | grep : | head -1)
+if [ -n "$ip6" ] && code=$(x client1 curl -s -m 10 -o /dev/null -w '%{http_code}' --resolve "example.com:443:[$ip6]" https://example.com/ 2>/dev/null) && [ "$code" = 200 ]; then
+  ok "client1 -> https://example.com ([$ip6]) over IPv6 via the VPN: HTTP $code"
+else
+  soft "IPv6 internet check skipped/failed (no IPv6 connectivity from Docker?)"
 fi
 
 echo "==> TAP mode (dev tap, virtual Ethernet switch)"

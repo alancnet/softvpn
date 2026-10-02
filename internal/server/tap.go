@@ -110,9 +110,11 @@ func (s *Server) routeBridged(pkt []byte) {
 	case dst == s.cfg.Gateway:
 		s.stack.Inject(pkt)
 	case s.cfg.Subnet.Contains(dst), dst.IsMulticast(), dst == netip.AddrFrom4([4]byte{255, 255, 255, 255}):
-	case pkt[9] == 1: // ICMP
-		if _, ok := s.policy("icmp", netip.AddrPort{}, netip.AddrPortFrom(dst, 0)); ok {
-			s.pinger.forward(pkt)
+	case pkt[9] == protoICMP:
+		if h, ok := parseIP(pkt); ok {
+			if _, ok := s.policy("icmp", netip.AddrPort{}, netip.AddrPortFrom(dst, 0)); ok {
+				s.pinger.forward(h, pkt)
+			}
 		}
 	default:
 		s.stack.Inject(pkt)

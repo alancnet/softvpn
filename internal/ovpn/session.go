@@ -19,10 +19,12 @@ import (
 // Assignment is what the application decides for a newly authenticated
 // client: its address and any extra options to push.
 type Assignment struct {
-	IP      netip.Addr
-	Netmask string // dotted quad, for "ifconfig"
-	Gateway netip.Addr
-	Push    []string
+	IP       netip.Addr
+	Netmask  string // dotted quad, for "ifconfig"
+	Gateway  netip.Addr
+	IP6      netip.Prefix // address/bits for "ifconfig-ipv6"; optional
+	Gateway6 netip.Addr
+	Push     []string
 	// TAP: the client is bridged (dev tap), so no "topology" is pushed.
 	// DHCP: the client gets its address by DHCP over the bridge instead of
 	// a pushed "ifconfig", and learns the gateway the same way. An invalid
@@ -543,8 +545,12 @@ func (s *Session) controlMessage(conn *tls.Conn, msg string) {
 			if s.useEKM {
 				kdf = "tls-ekm"
 			}
-			s.log.Info("client connected", "ip", a.IP, "cipher", s.cipher, "key_derivation", kdf,
-				"version", s.pi["IV_VER"], "platform", s.pi["IV_PLAT"])
+			attrs := []any{"ip", a.IP}
+			if a.IP6.IsValid() {
+				attrs = append(attrs, "ip6", a.IP6.Addr())
+			}
+			s.log.Info("client connected", append(attrs, "cipher", s.cipher, "key_derivation", kdf,
+				"version", s.pi["IV_VER"], "platform", s.pi["IV_PLAT"])...)
 		}
 	case msg == "EXIT" || strings.HasPrefix(msg, "EXIT,"):
 		go s.Close("client exited")
@@ -572,6 +578,9 @@ func (s *Session) pushReply(a *Assignment) []string {
 		fmt.Sprintf("ping %d", int(opt.PushPing/time.Second)),
 		fmt.Sprintf("ping-restart %d", int(opt.PushPingRestart/time.Second)),
 	)
+	if a.IP6.IsValid() {
+		opts = append(opts, "ifconfig-ipv6 "+a.IP6.String()+" "+a.Gateway6.String())
+	}
 	if !a.DHCP {
 		opts = append(opts, "ifconfig "+a.IP.String()+" "+a.Netmask)
 	}

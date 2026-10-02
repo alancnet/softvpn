@@ -23,6 +23,7 @@ type Policy func(network string, src, dst netip.AddrPort) (target string, ok boo
 // NATOptions configures EnableNAT.
 type NATOptions struct {
 	Gateway     netip.Prefix // the server's own virtual address and subnet
+	Gateway6    netip.Prefix // the same for IPv6; optional
 	Policy      Policy
 	Log         *slog.Logger
 	DialTimeout time.Duration
@@ -50,6 +51,11 @@ func (st *Stack) EnableNAT(o NATOptions) error {
 	}
 	if err := st.SetAddress(o.Gateway); err != nil {
 		return err
+	}
+	if o.Gateway6.IsValid() {
+		if err := st.SetAddress(o.Gateway6); err != nil {
+			return err
+		}
 	}
 	if err := st.s.SetPromiscuousMode(nicID, true); err != nil {
 		return fmt.Errorf("promiscuous mode: %s", err)
