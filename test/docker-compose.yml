@@ -1,7 +1,13 @@
 # softvpn end-to-end test.
 #
-#   wan   (${SVT_NET}.10.0/24, has internet)  server  web
-#   edge  (${SVT_NET}.20.0/24, internal: no route anywhere)  server  clients  probe
+#   wan     (${SVT_NET}.10.0/24, has internet)  server  tapserver  dhcpserver  web
+#   edge    (${SVT_NET}.20.0/24, internal: no route anywhere)  server  clients  probe
+#   tapedge (${SVT_NET}.30.0/24, internal)  tapserver  tapclient1  tapclient2
+#   dhcpedge (${SVT_NET}.40.0/24, internal)  dhcpserver  tapclient3
+#
+# tapserver and dhcpserver are softvpn in TAP (bridged) mode. Each answers
+# to the name "server" on its own edge network, so the generated client
+# profiles work unchanged; the TAP clients only add --dev tap.
 #
 # SVT_ID / SVT_NET (set by run.sh) keep parallel runs apart: project name,
 # image tags and subnets all derive from them.
@@ -30,6 +36,14 @@ networks:
     internal: true
     ipam:
       config: [{ subnet: "${SVT_NET:-10.231}.20.0/24" }]
+  tapedge:
+    internal: true
+    ipam:
+      config: [{ subnet: "${SVT_NET:-10.231}.30.0/24" }]
+  dhcpedge:
+    internal: true
+    ipam:
+      config: [{ subnet: "${SVT_NET:-10.231}.40.0/24" }]
 
 volumes:
   pki:
@@ -44,9 +58,10 @@ services:
     network_mode: none
     volumes: [pki:/pki]
     # -shared: clients run as a different uid; demo volume only.
-    command: [pki, init, -dir, /pki, -clients, "client1,client2,client3", -remote, server, -shared]
+    command: [pki, init, -dir, /pki, -clients, "client1,client2,client3,tapclient1,tapclient2,tapclient3", -remote, server, -shared]
 
   server:
+    &server
     <<: *locked-down
     image: softvpn:test${SVT_ID:-}
     user: "65534:65534"
@@ -61,6 +76,26 @@ services:
     networks:
       wan: { ipv4_address: "${SVT_NET:-10.231}.10.100" }
       edge: { ipv4_address: "${SVT_NET:-10.231}.20.100" }
+
+  # TAP mode: a virtual Ethernet switch with a server-bridge address pool.
+  tapserver:
+    <<: *server
+    volumes:
+      - pki:/pki:ro
+      - ./server-tap.conf:/etc/softvpn/server.conf:ro
+    networks:
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.101" }
+      tapedge: { ipv4_address: "${SVT_NET:-10.231}.30.100", aliases: [server] }
+
+  # TAP mode with "server-bridge" and no pool: clients use DHCP.
+  dhcpserver:
+    <<: *server
+    volumes:
+      - pki:/pki:ro
+      - ./server-dhcp.conf:/etc/softvpn/server.conf:ro
+    networks:
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.102" }
+      dhcpedge: { ipv4_address: "${SVT_NET:-10.231}.40.100", aliases: [server] }
 
   # Stand-in for the internet, reachable only from the server's network.
   web:
@@ -112,3 +147,29 @@ services:
     user: "65534:65534"
     command: [sleep, infinity]
     networks: [edge]
+
+  # TAP clients: the same stock clients with "dev tap". tapclient2 is
+  # OpenVPN 2.5 over TCP and serves HTTP for the client-to-client check.
+  tapclient1:
+    <<: *client
+    depends_on: [tapserver]
+    command: [client-entrypoint.sh, --config, /pki/tapclient1.ovpn, --dev, tap]
+    networks: [tapedge]
+
+  tapclient2:
+    <<: *client
+    build: { context: ./tools, args: { ALPINE: "3.17" } }
+    image: softvpn-test-tools${SVT_ID:-}:openvpn-2.5
+    depends_on: [tapserver]
+    command: [client-entrypoint.sh, --config, /pki/tapclient2.ovpn, --dev, tap, --proto, tcp-client]
+    environment: { SERVE_PORT: "8080" }
+    networks: [tapedge]
+
+  # Gets no pushed ifconfig ("route-gateway dhcp"); run.sh runs udhcpc,
+  # which also needs NET_RAW for its raw socket.
+  tapclient3:
+    <<: *client
+    cap_add: [NET_ADMIN, NET_RAW]
+    depends_on: [dhcpserver]
+    command: [client-entrypoint.sh, --config, /pki/tapclient3.ovpn, --dev, tap]
+    networks: [dhcpedge]

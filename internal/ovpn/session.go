@@ -21,6 +21,11 @@ type Assignment struct {
 	Netmask string // dotted quad, for "ifconfig"
 	Gateway netip.Addr
 	Push    []string
+	// TAP: the client is bridged (dev tap), so no "topology" is pushed.
+	// DHCP: the client gets its address by DHCP over the bridge instead of
+	// a pushed "ifconfig", and learns the gateway the same way. An invalid
+	// Gateway pushes no route-gateway at all.
+	TAP, DHCP bool
 }
 
 // Handler connects sessions to the application (the virtual router).
@@ -450,13 +455,23 @@ func (s *Session) controlMessage(conn *tls.Conn, msg string) {
 func (s *Session) pushReply(a *Assignment) []string {
 	opt := s.srv.opt
 	opts := append([]string(nil), a.Push...)
+	switch {
+	case !a.Gateway.IsValid():
+	case a.DHCP:
+		opts = append(opts, "route-gateway dhcp")
+	default:
+		opts = append(opts, "route-gateway "+a.Gateway.String())
+	}
+	if !a.TAP {
+		opts = append(opts, "topology subnet")
+	}
 	opts = append(opts,
-		"route-gateway "+a.Gateway.String(),
-		"topology subnet",
 		fmt.Sprintf("ping %d", int(opt.PushPing/time.Second)),
 		fmt.Sprintf("ping-restart %d", int(opt.PushPingRestart/time.Second)),
-		"ifconfig "+a.IP.String()+" "+a.Netmask,
 	)
+	if !a.DHCP {
+		opts = append(opts, "ifconfig "+a.IP.String()+" "+a.Netmask)
+	}
 	if s.useV2.Load() {
 		opts = append(opts, fmt.Sprintf("peer-id %d", s.peerID))
 	}
