@@ -31,12 +31,14 @@ type Server struct {
 	log    *slog.Logger
 	stack  *vnet.Stack
 	pinger *pinger
+	bridge *bridge // TAP mode only
 
 	mu       sync.RWMutex
 	pool     *pool
 	routes   *routes
 	byCN     map[string]*ovpn.Session
 	sessions map[*ovpn.Session]*peer
+	tokens   map[*ovpn.Session]string // auth-token to push at Connect
 }
 
 // peer is the router's view of a connected client: its addresses and the
@@ -73,14 +75,22 @@ func New(cfg *Config, log *slog.Logger) (*Server, error) {
 			}
 		}
 	}
-	return &Server{
+	s := &Server{
 		cfg:      cfg,
 		log:      log,
 		pool:     newPool(cfg.Subnet, cfg.Gateway, static),
 		routes:   newRoutes(),
 		byCN:     map[string]*ovpn.Session{},
 		sessions: map[*ovpn.Session]*peer{},
-	}, nil
+		tokens:   map[*ovpn.Session]string{},
+	}
+	if cfg.PoolStart.IsValid() {
+		s.pool.first, s.pool.last = cfg.PoolStart, cfg.PoolEnd
+	}
+	if cfg.TAP {
+		s.bridge = s.newBridge()
+	}
+	return s, nil
 }
 
 // Run serves until ctx is cancelled.
@@ -104,8 +114,13 @@ func (s *Server) Run(ctx context.Context) error {
 	s.stack = st
 	s.pinger = newPinger(s.log, s.deliver)
 
+	tlsConf := s.cfg.TLS
+	if s.cfg.Auth.CRL != nil {
+		tlsConf = tlsConf.Clone()
+		tlsConf.VerifyConnection = s.verifyConnection
+	}
 	engine := ovpn.NewServer(ovpn.Options{
-		TLS:             s.cfg.TLS,
+		TLS:             tlsConf,
 		Ciphers:         s.cfg.Ciphers,
 		PingInterval:    s.cfg.PingInterval,
 		PingTimeout:     2 * s.cfg.PingTimeout, // OpenVPN doubles the server side
@@ -147,8 +162,16 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.log.Info("virtual network up", append(attrs,
 		"client_to_client", s.cfg.ClientToClient, "upstream_dns", s.cfg.UpstreamDNS, "ciphers", strings.Join(s.cfg.Ciphers, ":"))...)
+	if s.bridge != nil {
+		s.log.Info("virtual switch up (dev tap)", "gateway_mac", s.cfg.MAC.String(), "pool", s.pool.first.String()+"-"+s.pool.last.String(), "dhcp_only", s.cfg.DHCP)
+	}
 	if s.cfg.StatusFile != "" {
 		go s.statusLoop(ctx)
+	}
+	if s.cfg.Auth.CRL != nil || s.cfg.Auth.Users != nil {
+		s.log.Info("client authentication", "verify_client_cert", s.cfg.Auth.VerifyClientCert,
+			"users", s.cfg.Auth.Users != nil, "crl", s.cfg.Auth.CRL != nil, "auth_gen_token", s.cfg.Auth.AuthGenToken)
+		go s.authWatch(ctx)
 	}
 
 	select {
@@ -167,6 +190,7 @@ func (s *Server) Run(ctx context.Context) error {
 // address.
 func (s *Server) Connect(ss *ovpn.Session) (*ovpn.Assignment, error) {
 	cn := ss.CommonName()
+	token := s.takeToken(ss)
 	cc, err := s.cfg.loadCCD(cn)
 	if err != nil {
 		s.log.Error("client-config-dir", "client", cn, "err", err)
@@ -221,14 +245,25 @@ func (s *Server) Connect(ss *ovpn.Session) (*ovpn.Assignment, error) {
 		push = append(push, s.cfg.Push...)
 	}
 	push = append(push, cc.Push...)
-	return &ovpn.Assignment{
+	if token != "" {
+		push = append(push, "auth-token "+token)
+	}
+	a := &ovpn.Assignment{
 		IP:       ip,
 		Netmask:  net.IP(net.CIDRMask(s.cfg.Subnet.Bits(), 32)).String(),
 		Gateway:  s.cfg.Gateway,
 		IP6:      ip6,
 		Gateway6: s.cfg.Gateway6,
 		Push:     withoutOwnRoutes(push, cc.IRoutes),
-	}, nil
+	}
+	if s.bridge != nil {
+		s.bridge.attach(ss, ip, push)
+		a.TAP, a.DHCP = true, s.cfg.DHCP
+		if s.cfg.NoGateway {
+			a.Gateway = netip.Addr{}
+		}
+	}
+	return a, nil
 }
 
 // withoutOwnRoutes drops pushed "route"/"route-ipv6" options for networks
@@ -296,6 +331,9 @@ func (s *Server) Disconnect(ss *ovpn.Session, reason string) {
 		}
 	}
 	s.mu.Unlock()
+	if s.bridge != nil {
+		s.bridge.detach(ss)
+	}
 	s.log.Info("client disconnected", "client", ss.CommonName(), "ip", ip, "reason", reason,
 		"rx_bytes", ss.RxBytes.Load(), "tx_bytes", ss.TxBytes.Load())
 }
@@ -303,6 +341,10 @@ func (s *Server) Disconnect(ss *ovpn.Session, reason string) {
 // Packet implements ovpn.Handler. It is the virtual router: every IP packet
 // a client sends passes through here.
 func (s *Server) Packet(ss *ovpn.Session, pkt []byte) {
+	if s.bridge != nil {
+		s.bridge.input(ss, pkt) // an Ethernet frame
+		return
+	}
 	h, ok := parseIP(pkt)
 	if !ok || h.dst.IsMulticast() {
 		return // includes IPv6 router solicitations and MLD from the tun
@@ -340,6 +382,10 @@ func (s *Server) Packet(ss *ovpn.Session, pkt []byte) {
 // deliver sends a packet to the client that owns its destination address
 // (or the network behind a client that it belongs to).
 func (s *Server) deliver(pkt []byte) {
+	if s.bridge != nil {
+		s.bridge.output(pkt)
+		return
+	}
 	h, ok := parseIP(pkt)
 	if !ok {
 		return

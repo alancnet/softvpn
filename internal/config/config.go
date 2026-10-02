@@ -50,6 +50,15 @@ func (d Directive) Arg(i int) string {
 	return ""
 }
 
+// Path returns argument i as a file name, resolved against the directory of
+// the file the directive came from.
+func (d Directive) Path(i int) string {
+	if a := d.Arg(i); a != "" && d.dir != "" {
+		return resolve(d.dir, a)
+	}
+	return d.Arg(i)
+}
+
 // Config is an ordered set of directives plus inline blocks.
 type Config struct {
 	Directives []Directive

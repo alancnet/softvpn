@@ -22,6 +22,7 @@ var directives = []string{
 	"route", "route-ipv6",
 	"client-to-client", "duplicate-cn", "keepalive", "push", "client-config-dir",
 	"max-clients", "data-ciphers", "ncp-ciphers", "tun-mtu", "status", "verb",
+	"server-bridge", "dev-type", "lladdr",
 	// softvpn extensions
 	"upstream-dns", "nat-allow", "nat-deny",
 }
@@ -33,7 +34,7 @@ var ignored = []string{
 	"explicit-exit-notify", "ifconfig-pool-persist", "tls-server", "mode",
 	"data-ciphers-fallback", "tls-version-min", "remote-cert-tls", "mute",
 	"log", "log-append", "daemon", "script-security", "sndbuf", "rcvbuf",
-	"txqueuelen", "fast-io", "mssfix", "tun-mtu-extra", "dev-type",
+	"txqueuelen", "fast-io", "mssfix", "tun-mtu-extra",
 }
 
 // Listener is one transport the server accepts clients on.
@@ -67,11 +68,24 @@ type Config struct {
 	StatusFile     string
 	StatusInterval time.Duration
 	Verb           int
+	Auth           AuthConfig
+
+	// TAP (bridged) mode: clients exchange Ethernet frames over a virtual
+	// switch; see bridge.go.
+	TAP       bool
+	PoolStart netip.Addr // server-bridge address range (else the whole subnet)
+	PoolEnd   netip.Addr
+	DHCP      bool // server-bridge without arguments: addresses only by DHCP
+	NoGateway bool // server-bridge nogw: no route-gateway, no DHCP router
+	MAC       net.HardwareAddr
 }
 
 // Load validates directives and builds a server Config.
 func Load(c *config.Config) (*Config, error) {
-	if err := c.Check(append(directives, ignored...)...); err != nil {
+	if err := rejectScripts(c); err != nil {
+		return nil, err
+	}
+	if err := c.Check(append(append(directives, authDirectives...), ignored...)...); err != nil {
 		return nil, err
 	}
 	cfg := &Config{
@@ -111,10 +125,29 @@ func Load(c *config.Config) (*Config, error) {
 		cfg.Listeners = append(cfg.Listeners, Listener{Proto: p, Network: network, Addr: net.JoinHostPort(local, port)})
 	}
 
-	if d, ok := c.Last("dev"); ok && !strings.HasPrefix(d.Arg(0), "tun") {
-		return nil, d.Errorf("only routed (tun) mode is supported")
+	// The device type comes from dev-type, or else the dev name (tun0, tap).
+	if d, ok := c.Last("dev"); ok {
+		switch {
+		case strings.HasPrefix(d.Arg(0), "tun"):
+		case strings.HasPrefix(d.Arg(0), "tap"):
+			cfg.TAP = true
+		default:
+			if !c.Has("dev-type") {
+				return nil, d.Errorf("cannot tell the device type of %q (use tun or tap, or set dev-type)", d.Arg(0))
+			}
+		}
 	}
-	if d, ok := c.Last("topology"); ok && d.Arg(0) != "subnet" {
+	if d, ok := c.Last("dev-type"); ok {
+		switch d.Arg(0) {
+		case "tun":
+			cfg.TAP = false
+		case "tap":
+			cfg.TAP = true
+		default:
+			return nil, d.Errorf("dev-type must be tun or tap")
+		}
+	}
+	if d, ok := c.Last("topology"); ok && d.Arg(0) != "subnet" && !cfg.TAP {
 		return nil, d.Errorf("only \"topology subnet\" is supported")
 	}
 
@@ -141,6 +174,9 @@ func Load(c *config.Config) (*Config, error) {
 	}
 	cfg.Subnet = p.Masked()
 	cfg.Gateway = cfg.Subnet.Addr().Next()
+	if err := cfg.loadBridge(c); err != nil {
+		return nil, err
+	}
 
 	// server-ipv6 fd00:8::/64: the gateway is ::1 and each client's address
 	// is derived from its IPv4 one, starting at ::1000 like OpenVPN's pool.
@@ -176,6 +212,9 @@ func Load(c *config.Config) (*Config, error) {
 			return nil, d.Errorf("%v", err)
 		}
 		cfg.Routes = append(cfg.Routes, pfx)
+	}
+	if cfg.TAP && (cfg.Subnet6.IsValid() || len(cfg.Routes) > 0) {
+		return nil, fmt.Errorf("server-ipv6, route and route-ipv6 are not supported with dev tap")
 	}
 
 	if cfg.MTU, err = c.Int("tun-mtu", 1500); err != nil {
@@ -269,6 +308,9 @@ func Load(c *config.Config) (*Config, error) {
 		return nil, err
 	}
 	if cfg.TLS, err = pki.ServerTLS(ca, cert, key); err != nil {
+		return nil, err
+	}
+	if cfg.Auth, err = loadAuth(c, ca, cfg.TLS); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -458,6 +500,9 @@ func (cfg *Config) loadCCD(cn string) (*clientConfig, error) {
 			return nil, d.Errorf("%v", err)
 		}
 		cc.IRoutes = append(cc.IRoutes, p)
+	}
+	if len(cc.IRoutes) > 0 && cfg.TAP {
+		return nil, fmt.Errorf("%s: iroute is not supported with dev tap", path)
 	}
 	for _, p := range cc.IRoutes {
 		if p.Overlaps(cfg.Subnet) || p.Overlaps(cfg.Subnet6) {

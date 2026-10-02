@@ -8,11 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/softvpn/softvpn/internal/config"
 	"github.com/softvpn/softvpn/internal/ovpn"
-	"github.com/softvpn/softvpn/internal/pki"
 )
 
 func TestRoutes(t *testing.T) {
@@ -116,29 +113,9 @@ func TestIPv6Packet(t *testing.T) {
 	}
 }
 
-// testPKI returns ca/cert/key directives for a throwaway PKI.
-func testPKI(t *testing.T) string {
-	t.Helper()
-	d := pki.Dir{Path: t.TempDir()}
-	if err := d.Init("server", nil, time.Hour); err != nil {
-		t.Fatal(err)
-	}
-	return "ca " + filepath.Join(d.Path, "ca.crt") + "\ncert " + filepath.Join(d.Path, "server.crt") +
-		"\nkey " + filepath.Join(d.Path, "server.key") + "\n"
-}
-
-func load(t *testing.T, conf string) (*Config, error) {
-	t.Helper()
-	c, err := config.ParseString(conf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return Load(c)
-}
-
 func TestLoadIPv6AndRoutes(t *testing.T) {
-	material := testPKI(t)
-	cfg, err := load(t, material+`
+	dir := testPKI(t)
+	cfg, err := load(dir, `
 server 10.8.0.0 255.255.255.0
 server-ipv6 fd00:8::/64
 proto udp
@@ -192,8 +169,10 @@ route-ipv6 fd00:30::/64
 		"route-ipv6 fd00:30::1/64",
 		"route-ipv6 192.168.0.0/16",
 		"proto sctp",
+		"dev tap\nserver-ipv6 fd00:8::/64", // IPv4 only in TAP mode
+		"dev tap\nroute 192.168.10.0 255.255.255.0",
 	} {
-		if _, err := load(t, material+bad+"\n"); err == nil {
+		if _, err := load(dir, bad+"\n"); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
 	}
