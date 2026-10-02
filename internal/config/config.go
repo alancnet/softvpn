@@ -286,18 +286,41 @@ func Seconds(s string) (time.Duration, error) {
 // Material returns key material for name: an inline <name> block if present,
 // otherwise the contents of the file named by the directive's argument.
 func (c *Config) Material(name string) ([]byte, error) {
+	b, _, err := c.MaterialArgs(name, 0)
+	return b, err
+}
+
+// MaterialArgs is Material for directives whose file name may be followed by
+// up to extra more arguments ("tls-auth ta.key 0"), which it also returns.
+// The file name "[inline]" (older OpenVPN syntax) selects the inline block.
+func (c *Config) MaterialArgs(name string, extra int) ([]byte, []string, error) {
 	if d, ok := c.Last(name); ok {
-		if len(d.Args) != 1 {
-			return nil, d.Errorf("expects one file name")
+		if len(d.Args) < 1 || len(d.Args) > 1+extra {
+			if extra == 0 {
+				return nil, nil, d.Errorf("expects one file name")
+			}
+			return nil, nil, d.Errorf("expects a file name and at most %d more argument(s)", extra)
+		}
+		if d.Args[0] == "[inline]" {
+			if v, ok := c.Inline[name]; ok {
+				return []byte(v), d.Args[1:], nil
+			}
+			return nil, nil, d.Errorf("no inline <%s> block", name)
 		}
 		b, err := os.ReadFile(resolve(d.dir, d.Args[0]))
 		if err != nil {
-			return nil, d.Errorf("%v", err)
+			return nil, nil, d.Errorf("%v", err)
 		}
-		return b, nil
+		return b, d.Args[1:], nil
 	}
 	if v, ok := c.Inline[name]; ok {
-		return []byte(v), nil
+		return []byte(v), nil, nil
 	}
-	return nil, fmt.Errorf("missing %q (give a file with \"%s FILE\" or an inline <%s> block)", name, name, name)
+	return nil, nil, fmt.Errorf("missing %q (give a file with \"%s FILE\" or an inline <%s> block)", name, name, name)
+}
+
+// HasMaterial reports whether name is given as a directive or an inline block.
+func (c *Config) HasMaterial(name string) bool {
+	_, ok := c.Inline[name]
+	return ok || c.Has(name)
 }

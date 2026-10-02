@@ -53,7 +53,8 @@ func keyIDOf(b byte) byte  { return b & 0x07 }
 
 func isControl(op byte) bool {
 	switch op {
-	case opControlHardResetClientV2, opControlSoftResetV1, opControlV1, opAckV1:
+	case opControlHardResetClientV2, opControlSoftResetV1, opControlV1, opAckV1,
+		opControlHardResetClientV3, opControlWKCV1:
 		return true
 	}
 	return false

@@ -52,6 +52,8 @@ type Session struct {
 	remoteSID sessionID
 	peerID    uint32
 	created   time.Time
+	wrap      *tlsWrap   // tls-auth / tls-crypt state; nil without
+	sendMu    sync.Mutex // keeps wrapped control packets in packet-id order
 
 	mu     sync.Mutex
 	keys   [8]*keyState
@@ -81,12 +83,13 @@ type keyState struct {
 	data atomic.Pointer[dataKeys]
 }
 
-func newSession(srv *Server, tr transport, remoteSID sessionID, peerID uint32) *Session {
+func newSession(srv *Server, tr transport, remoteSID sessionID, peerID uint32, wrap *tlsWrap) *Session {
 	s := &Session{
 		srv:       srv,
 		tr:        tr,
 		remoteSID: remoteSID,
 		peerID:    peerID,
+		wrap:      wrap,
 		created:   time.Now(),
 		done:      make(chan struct{}),
 	}
@@ -145,11 +148,19 @@ func (s *Session) newKeyState(id byte, initialOp byte) *keyState {
 }
 
 func (s *Session) sendAll(pkts [][]byte) {
+	var err error
+	s.sendMu.Lock()
 	for _, p := range pkts {
-		if err := s.tr.send(p); err != nil {
-			s.Close(fmt.Sprintf("send: %v", err))
-			return
+		if s.wrap != nil {
+			p = s.wrap.wrap(p)
 		}
+		if err = s.tr.send(p); err != nil {
+			break
+		}
+	}
+	s.sendMu.Unlock()
+	if err != nil {
+		s.Close(fmt.Sprintf("send: %v", err))
 	}
 }
 
@@ -158,10 +169,20 @@ func (s *Session) input(b []byte) {
 	if len(b) < 1 {
 		return
 	}
-	switch op := opcodeOf(b[0]); op {
-	case opDataV1, opDataV2:
+	switch op := opcodeOf(b[0]); {
+	case op == opDataV1 || op == opDataV2:
 		s.inputData(op, b)
-	case opControlHardResetClientV2, opControlSoftResetV1, opControlV1, opAckV1:
+	case isControl(op):
+		if s.wrap != nil {
+			var err error
+			if b, err = s.wrap.unwrapInput(b); err != nil {
+				s.log.Debug("dropping control packet", "mode", s.wrap.mode, "err", err)
+				return
+			}
+		} else if hasWKc(op) {
+			s.log.Debug("ignoring tls-crypt-v2 packet: server has no tls-crypt-v2 key", "opcode", op)
+			return
+		}
 		s.inputControl(b)
 	default:
 		s.log.Debug("ignoring packet with unsupported opcode", "opcode", op)

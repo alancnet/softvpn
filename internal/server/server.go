@@ -90,7 +90,11 @@ func (s *Server) Run(ctx context.Context) error {
 		PingTimeout:     2 * s.cfg.PingTimeout, // OpenVPN doubles the server side
 		PushPing:        s.cfg.PingInterval,
 		PushPingRestart: s.cfg.PingTimeout,
+		Wrap:            s.cfg.Wrap,
 	}, s, s.log)
+	if w := s.cfg.Wrap; w != nil {
+		s.log.Info("control channel protected", "mode", w.Mode)
+	}
 
 	errc := make(chan error, len(s.cfg.Listeners))
 	for _, l := range s.cfg.Listeners {

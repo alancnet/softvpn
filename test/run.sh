@@ -37,8 +37,8 @@ if ! out=$(dc up -d --build --quiet-pull 2>&1); then
   exit 1
 fi
 
-echo "==> waiting for both clients to finish connecting"
-for c in client1 client2 client3; do
+echo "==> waiting for the clients to finish connecting"
+for c in client1 client2 client3 client4 client5 client6 client7; do
   for _ in $(seq 1 30); do
     dc logs "$c" 2>/dev/null | grep -q "Initialization Sequence Completed" && break
     sleep 1
@@ -136,6 +136,57 @@ if [ "$n" -ge 2 ] && dc logs client1 2>/dev/null | grep -q 'TLS: soft reset'; th
 else
   bad "client1 renegotiated keys" "server saw $n rekeys"
 fi
+
+echo "==> control-channel protection: tls-auth, tls-crypt, tls-crypt-v2"
+for svc in server-tls-auth server-tls-crypt server-tls-crypt-v2; do
+  id=$(dc ps -q "$svc")
+  [ -n "$id" ] || { bad "$svc is running"; continue; }
+  got=$(docker inspect -f '{{.Config.User}} {{json .HostConfig.CapDrop}} {{json .HostConfig.CapAdd}} {{.HostConfig.ReadonlyRootfs}} {{len .HostConfig.Devices}} {{.HostConfig.Privileged}}' "$id")
+  [ "$got" = '65534:65534 ["ALL"] null true 0 false' ] && ok "$svc is locked down like server (uid 65534, no capabilities, read-only, no devices)" || bad "$svc locked down" "$got"
+done
+# wrapped CLIENT SERVER WAN_IP DESCRIPTION: connected, version, NAT through that server
+wrapped() {
+  local line out
+  line=$(dc logs --no-log-prefix "$2" 2>/dev/null | grep 'client connected' | grep "client=$1 ")
+  out=$(x "$1" curl -s -m 5 http://$WEB/ 2>&1)
+  if [ -n "$line" ] && echo "$out" | grep -q "you are $3"; then
+    ok "$1: $4 (OpenVPN $(echo "$line" | sed -n 's/.*version=\([^ ]*\).*/\1/p')) -> web, NATed by $2"
+  else
+    bad "$1: $4" "server: ${line:-not connected}; web: $out"
+  fi
+}
+wrapped client4 server-tls-auth $SVT_NET.10.101 "tls-auth, key-direction 1, HMAC-SHA256 (auth SHA256), UDP"
+wrapped client5 server-tls-crypt $SVT_NET.10.102 "tls-crypt over TCP"
+wrapped client6 server-tls-crypt-v2 $SVT_NET.10.103 "tls-crypt-v2"
+wrapped client7 server-tls-crypt-v2 $SVT_NET.10.103 "tls-crypt-v2"
+dc logs --no-log-prefix server-tls-crypt-v2 2>/dev/null | grep 'client=client7 ' | grep -q 'version=2.5' &&
+  ok "client7 is OpenVPN 2.5 (P_CONTROL_HARD_RESET_CLIENT_V3 without 2.6 extensions)" || bad "client7 is OpenVPN 2.5"
+
+# trial SVC CONFIG [ARGS...]: a throwaway client (no tun device) in SVC;
+# succeeds if it completes the handshake within 6 s.
+trial() {
+  local svc=$1 conf=$2; shift 2
+  x "$svc" sh -c "openvpn --config $conf --dev null --ifconfig-noexec --route-noexec --verb 3 $* >/tmp/trial.log 2>&1 & p=\$!
+    for i in \$(seq 12); do grep -q 'Initialization Sequence Completed' /tmp/trial.log && break; sleep 0.5; done
+    kill \$p; wait \$p; grep -q 'Initialization Sequence Completed' /tmp/trial.log"
+}
+if trial client4 /pki/client4.ovpn; then bad "tls-auth: client with the default SHA1 HMAC is refused"; else ok "tls-auth: client with the default SHA1 HMAC is refused (server uses auth SHA256)"; fi
+x client5 sh -c "sed '/<tls-crypt>/,/<\/tls-crypt>/d' /pki/client5.ovpn >/tmp/nokey.ovpn"
+if trial client5 /tmp/nokey.ovpn; then bad "tls-crypt: client without the key is refused"; else ok "tls-crypt: client without the key is refused"; fi
+# client8's certificate is only for these trials. Keys made by the stock
+# openvpn binary: one wrapped by another server key, and one wrapped by
+# softvpn's (Go-generated) server key.
+x client6 sh -c "sed '/<tls-crypt-v2>/,/<\/tls-crypt-v2>/d' /pki/client8.ovpn >/tmp/nokey.ovpn &&
+  openvpn --genkey tls-crypt-v2-server /tmp/other-server.key >/dev/null &&
+  openvpn --tls-crypt-v2 /tmp/other-server.key --genkey tls-crypt-v2-client /tmp/foreign.key >/dev/null &&
+  openvpn --tls-crypt-v2 /pki/tls-crypt-v2.key --genkey tls-crypt-v2-client /tmp/openvpn-made.key >/dev/null"
+if trial client6 /tmp/nokey.ovpn --tls-crypt-v2 /tmp/foreign.key; then bad "tls-crypt-v2: client key wrapped by another server key is refused"; else ok "tls-crypt-v2: client key wrapped by another server key is refused"; fi
+check "tls-crypt-v2: client key made by openvpn --genkey from softvpn's server key is accepted" trial client6 /tmp/nokey.ovpn --tls-crypt-v2 /tmp/openvpn-made.key
+
+rekeys=$(dc logs server-tls-crypt 2>/dev/null | grep -c 'data channel rekeyed')
+out=$(x client5 curl -s -m 5 http://$WEB/ 2>&1)
+[ "$rekeys" -ge 2 ] && echo "$out" | grep -q "you are $SVT_NET.10.102" &&
+  ok "tls-crypt: traffic still flows after $rekeys renegotiations over TCP (client5, reneg-sec 15)" || bad "tls-crypt renegotiation" "rekeys=$rekeys web: $out"
 
 echo "==> server log"
 dc logs --no-log-prefix server 2>/dev/null | grep -E 'connected|listening' | sed 's/^/    /'

@@ -189,6 +189,8 @@ type Dir struct {
 	// Shared makes private keys and profiles readable by every user. Only
 	// for demos where containers running as different users share a volume.
 	Shared bool
+	// Wrap is the control-channel protection profiles embed a key for.
+	Wrap Wrap
 }
 
 func (d Dir) path(name string) string { return filepath.Join(d.Path, name) }
@@ -242,8 +244,8 @@ func (d Dir) Issue(name string, role Role, sans []string, validity time.Duration
 }
 
 func (d Dir) issue(ca *CA, name string, role Role, sans []string, validity time.Duration) error {
-	if name == "" || name == "ca" || filepath.Base(name) != name {
-		return fmt.Errorf("invalid certificate name %q", name)
+	if err := validName(name); err != nil {
+		return err
 	}
 	cert, key, err := ca.Issue(name, role, sans, validity)
 	if err != nil {
@@ -253,6 +255,13 @@ func (d Dir) issue(ca *CA, name string, role Role, sans []string, validity time.
 		return err
 	}
 	return d.write(name+".key", key, d.privateMode())
+}
+
+func validName(name string) error {
+	if name == "" || name == "ca" || filepath.Base(name) != name {
+		return fmt.Errorf("invalid certificate name %q", name)
+	}
+	return nil
 }
 
 func (d Dir) LoadCA() (*CA, error) {
@@ -292,11 +301,16 @@ func (d Dir) Profile(name, remote string, port int, proto string) (string, error
 	if err != nil {
 		return "", err
 	}
+	wrap, err := d.wrapBlock(name)
+	if err != nil {
+		return "", err
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "# softvpn client profile for %q (stock OpenVPN 2.5+ client)\n", name)
 	fmt.Fprintf(&b, "client\ndev tun\nproto %s\nremote %s %d\n", proto, remote, port)
 	b.WriteString("nobind\nresolv-retry infinite\npersist-key\nremote-cert-tls server\nverb 3\n")
 	fmt.Fprintf(&b, "<ca>\n%s</ca>\n<cert>\n%s</cert>\n<key>\n%s</key>\n", ca, cert, key)
+	b.WriteString(wrap)
 	return b.String(), nil
 }
 

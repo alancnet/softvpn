@@ -64,10 +64,33 @@ push "dhcp-option DNS 10.8.0.1"
 Any directive can also go on the command line, as with OpenVPN:
 `softvpn server --config server.conf --verb 4`.
 
+### Control-channel keys
+
+`-wrap tls-auth|tls-crypt|tls-crypt-v2` on `pki init`, `pki client` and
+`pki profile` creates the keys that are missing and embeds the client's key in
+its profiles. Add the matching line to `server.conf`:
+
+| `-wrap` | key files in the PKI directory | `server.conf` | profile gets |
+|---|---|---|---|
+| `tls-auth` | `ta.key` | `tls-auth /pki/ta.key 0` | `<tls-auth>` and `key-direction 1` |
+| `tls-crypt` | `tc.key` | `tls-crypt /pki/tc.key` | `<tls-crypt>` |
+| `tls-crypt-v2` | `tls-crypt-v2.key`, plus `NAME-tls-crypt-v2.key` per client | `tls-crypt-v2 /pki/tls-crypt-v2.key` | `<tls-crypt-v2>` with that client's key |
+
+```sh
+softvpn pki init -dir /pki -wrap tls-crypt-v2 -clients laptop -remote vpn.example.com
+```
+
+`softvpn pki genkey` makes single keys, like `openvpn --genkey`:
+`genkey tls-auth`, `genkey tls-crypt`, `genkey tls-crypt-v2` (server key),
+and `genkey [-metadata TEXT] tls-crypt-v2-client NAME`. Keys go into `-dir`
+under the names above, and existing ones are kept; `-out FILE` (or `-` for
+stdout) writes elsewhere. If the server sets `auth`, put the same `auth` line
+in tls-auth client profiles.
+
 ## End-to-end test
 
 ```sh
-test/run.sh            # builds, runs 26 checks, tears down
+test/run.sh            # builds, runs 39 checks, tears down
 KEEP=1 test/run.sh     # leave it running afterwards
 ```
 
@@ -76,10 +99,14 @@ KEEP=1 test/run.sh     # leave it running afterwards
 | container | network | notes |
 |---|---|---|
 | `server` | `wan` + `edge` | softvpn; uid 65534, all capabilities dropped, read-only, no devices |
+| `server-tls-auth`, `server-tls-crypt`, `server-tls-crypt-v2` | `wan` + `edge` | the same, each with one kind of control-channel protection |
 | `web` | `wan` only | stands in for the internet: HTTP, bulk download, UDP echo |
 | `client1` | `edge` only | stock OpenVPN 2.6 over UDP; rekeys every 15 s |
 | `client2` | `edge` only | stock OpenVPN 2.6 over TCP; static IP from `client-config-dir` |
 | `client3` | `edge` only | stock OpenVPN 2.5 with ChaCha20-Poly1305 and legacy key derivation |
+| `client4` | `edge` only | OpenVPN 2.6, `tls-auth` with `key-direction 1` and `auth SHA256` |
+| `client5` | `edge` only | OpenVPN 2.6, `tls-crypt` over TCP; rekeys every 15 s |
+| `client6`, `client7` | `edge` only | `tls-crypt-v2` with OpenVPN 2.6 and 2.5 |
 | `probe` | `edge` only | no VPN; proves `edge` can't reach anything by itself |
 
 `edge` is a Docker `internal` network, so anything a client reaches on `wan`
@@ -89,7 +116,12 @@ effective capability set), address assignment, `redirect-gateway`, TCP, UDP,
 and ICMP NAT (the web server sees the server's address), DNS through the VPN
 gateway, client-to-client routing, a 50 MB transfer with throughput, real
 HTTPS to example.com through the server's default gateway, and traffic
-continuing across key renegotiations.
+continuing across key renegotiations. For control-channel protection they
+check that each wrapped client connects and is NATed by its server, that
+clients with the wrong HMAC digest, no key, or a tls-crypt-v2 key from another
+server are refused, and that a tls-crypt-v2 client key made by the stock
+`openvpn --genkey` from softvpn's server key is accepted. All keys and
+profiles in the test come from softvpn's own generator (the `pki-*` services).
 
 No container is privileged. The OpenVPN *clients* get `/dev/net/tun` and the
 single capability `NET_ADMIN`, because the stock client always creates a
@@ -102,6 +134,20 @@ neither.
   extension; OpenVPN takes only one).
 - TLS 1.2/1.3 control channel with mutual certificate authentication, plus
   OpenVPN's control-channel reliability layer.
+- Control-channel protection, one per server:
+  - `tls-auth FILE [0|1]` (or an inline `<tls-auth>` block with
+    `key-direction`): HMAC on every control packet, with the digest from
+    `auth` (SHA1 by default; SHA224/256/384/512).
+  - `tls-crypt FILE`: control packets encrypted and authenticated with
+    AES-256-CTR and HMAC-SHA256.
+  - `tls-crypt-v2 FILE` (the server key): like tls-crypt, but every client has
+    its own key, which it sends wrapped by the server key in its first packet
+    (`P_CONTROL_HARD_RESET_CLIENT_V3`, and `P_CONTROL_WKC_V1` if sent).
+
+  Packets that fail the check, or repeat a packet id, are dropped before any
+  state is created for them. Key files are OpenVPN's formats, so keys from
+  `openvpn --genkey` work, and `softvpn pki` makes the same keys without an
+  openvpn binary.
 - Data channel: AES-256-GCM, AES-128-GCM, and CHACHA20-POLY1305, negotiated
   via `data-ciphers`; P_DATA_V2 with peer-id and client floating; 64-packet
   replay window.
@@ -127,7 +173,8 @@ softvpn doesn't implement are rejected at startup.
 
 ## Not supported (yet)
 
-- `tls-auth`, `tls-crypt`, and `tls-crypt-v2`: remove them from client profiles.
+- `tls-crypt-v2-verify` and `tls-crypt-v2-max-age`: client key metadata is
+  not checked.
 - Compression (`compress`, `comp-lzo`): clients must not enable it.
 - `auth-user-pass` and plugins: authentication is by client certificate only.
 - IPv6 inside the tunnel, TAP/bridged mode, `iroute` (routing to networks
@@ -139,9 +186,9 @@ softvpn doesn't implement are rejected at startup.
 
 | path | what |
 |---|---|
-| [cmd/softvpn](cmd/softvpn/main.go) | CLI: `server`, `pki init/client/profile` |
-| [internal/ovpn](internal/ovpn) | OpenVPN protocol: packets, reliability layer, TLS-over-control-channel, key exchange, data-channel crypto, UDP/TCP transports |
+| [cmd/softvpn](cmd/softvpn/main.go) | CLI: `server`, `pki init/client/profile/genkey` |
+| [internal/ovpn](internal/ovpn) | OpenVPN protocol: packets, reliability layer, tls-auth/tls-crypt/tls-crypt-v2 and their key formats, TLS-over-control-channel, key exchange, data-channel crypto, UDP/TCP transports |
 | [internal/server](internal/server) | config, address pool, virtual router, soft-NAT policy, ICMP NAT |
 | [internal/vnet](internal/vnet) | gVisor stack in promiscuous/spoofing mode, TCP/UDP forwarders (the NAT) |
-| [internal/pki](internal/pki) | minimal CA (easy-rsa replacement) and `.ovpn` profile generation |
+| [internal/pki](internal/pki) | minimal CA (easy-rsa replacement), control-channel key generation, and `.ovpn` profile generation |
 | [internal/config](internal/config) | OpenVPN config syntax: directives, quoting, inline `<ca>` blocks, argv |

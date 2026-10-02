@@ -20,6 +20,7 @@ var directives = []string{
 	"port", "proto", "local", "dev", "server", "topology", "ca", "cert", "key",
 	"client-to-client", "duplicate-cn", "keepalive", "push", "client-config-dir",
 	"max-clients", "data-ciphers", "ncp-ciphers", "tun-mtu", "status", "verb",
+	"tls-auth", "tls-crypt", "tls-crypt-v2", "key-direction", "auth",
 	// softvpn extensions
 	"upstream-dns", "nat-allow", "nat-deny",
 }
@@ -27,7 +28,7 @@ var directives = []string{
 // Directives that only make sense for a kernel-based OpenVPN, accepted so an
 // existing server.conf works unchanged.
 var ignored = []string{
-	"dh", "persist-key", "persist-tun", "user", "group", "cipher", "auth",
+	"dh", "persist-key", "persist-tun", "user", "group", "cipher",
 	"explicit-exit-notify", "ifconfig-pool-persist", "tls-server", "mode",
 	"data-ciphers-fallback", "tls-version-min", "remote-cert-tls", "mute",
 	"log", "log-append", "daemon", "script-security", "sndbuf", "rcvbuf",
@@ -46,6 +47,7 @@ type Config struct {
 	Subnet         netip.Prefix
 	Gateway        netip.Addr
 	TLS            *tls.Config
+	Wrap           *ovpn.ControlWrap // tls-auth / tls-crypt / tls-crypt-v2
 	Ciphers        []string
 	ClientToClient bool
 	DuplicateCN    bool
@@ -222,6 +224,9 @@ func Load(c *config.Config) (*Config, error) {
 		return nil, err
 	}
 	if cfg.TLS, err = pki.ServerTLS(ca, cert, key); err != nil {
+		return nil, err
+	}
+	if cfg.Wrap, err = controlWrap(c); err != nil {
 		return nil, err
 	}
 	return cfg, nil

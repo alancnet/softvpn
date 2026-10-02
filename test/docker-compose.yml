@@ -10,6 +10,9 @@
 # reach on "wan" or the internet must have gone through the VPN and been
 # NATed in software by the server.
 #
+# server-tls-auth, server-tls-crypt and server-tls-crypt-v2 are the same
+# server with each kind of control-channel protection, for clients 4-7.
+#
 # server:  no capabilities at all, uid 65534, read-only root filesystem.
 # clients: the stock OpenVPN client. Not privileged, but like any OpenVPN
 #          client it needs a TUN device, so it gets /dev/net/tun and
@@ -46,7 +49,33 @@ services:
     # -shared: clients run as a different uid; demo volume only.
     command: [pki, init, -dir, /pki, -clients, "client1,client2,client3", -remote, server, -shared]
 
+  # Control-channel keys (ta.key, tc.key, tls-crypt-v2.key, and a
+  # tls-crypt-v2 key per client) and profiles embedding them, from softvpn's
+  # own key generator. They run one after another on the same volume.
+  # client8 has no container: run.sh uses it for throwaway trial clients.
+  pki-tls-auth:
+    &pki-wrap
+    <<: *locked-down
+    image: softvpn:test${SVT_ID:-}
+    user: "65534:65534"
+    network_mode: none
+    volumes: [pki:/pki]
+    depends_on:
+      pki: { condition: service_completed_successfully }
+    command: [pki, init, -dir, /pki, -wrap, tls-auth, -clients, client4, -remote, server-tls-auth, -shared]
+  pki-tls-crypt:
+    <<: *pki-wrap
+    depends_on:
+      pki-tls-auth: { condition: service_completed_successfully }
+    command: [pki, init, -dir, /pki, -wrap, tls-crypt, -clients, client5, -remote, server-tls-crypt, -shared]
+  pki-tls-crypt-v2:
+    <<: *pki-wrap
+    depends_on:
+      pki-tls-crypt: { condition: service_completed_successfully }
+    command: [pki, init, -dir, /pki, -wrap, tls-crypt-v2, -clients, "client6,client7,client8", -remote, server-tls-crypt-v2, -shared]
+
   server:
+    &server
     <<: *locked-down
     image: softvpn:test${SVT_ID:-}
     user: "65534:65534"
@@ -61,6 +90,33 @@ services:
     networks:
       wan: { ipv4_address: "${SVT_NET:-10.231}.10.100" }
       edge: { ipv4_address: "${SVT_NET:-10.231}.20.100" }
+
+  # The same server.conf plus control-channel protection on the command
+  # line. tls-auth also uses a non-default HMAC digest ("auth SHA256").
+  server-tls-auth:
+    <<: *server
+    depends_on:
+      pki-tls-crypt-v2: { condition: service_completed_successfully }
+    command: [server, --config, /etc/softvpn/server.conf, --tls-auth, /pki/ta.key, "0", --auth, SHA256]
+    networks:
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.101" }
+      edge: { ipv4_address: "${SVT_NET:-10.231}.20.101" }
+  server-tls-crypt:
+    <<: *server
+    depends_on:
+      pki-tls-crypt-v2: { condition: service_completed_successfully }
+    command: [server, --config, /etc/softvpn/server.conf, --tls-crypt, /pki/tc.key]
+    networks:
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.102" }
+      edge: { ipv4_address: "${SVT_NET:-10.231}.20.102" }
+  server-tls-crypt-v2:
+    <<: *server
+    depends_on:
+      pki-tls-crypt-v2: { condition: service_completed_successfully }
+    command: [server, --config, /etc/softvpn/server.conf, --tls-crypt-v2, /pki/tls-crypt-v2.key]
+    networks:
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.103" }
+      edge: { ipv4_address: "${SVT_NET:-10.231}.20.103" }
 
   # Stand-in for the internet, reachable only from the server's network.
   web:
@@ -99,10 +155,31 @@ services:
   # An older OpenVPN (2.5.10): no tls-ekm, so keys come from OpenVPN's legacy
   # PRF; and it only offers ChaCha20-Poly1305.
   client3:
+    &client25
     <<: *client
     build: { context: ./tools, args: { ALPINE: "3.17" } }
     image: softvpn-test-tools${SVT_ID:-}:openvpn-2.5
     command: [client-entrypoint.sh, --config, /pki/client3.ovpn, --data-ciphers, CHACHA20-POLY1305]
+
+  # Control-channel protection: tls-auth (key-direction 1, HMAC-SHA256) over
+  # UDP; tls-crypt over TCP, rekeying every 15s; tls-crypt-v2 with OpenVPN
+  # 2.6 and with 2.5.
+  client4:
+    <<: *client
+    depends_on: [server-tls-auth]
+    command: [client-entrypoint.sh, --config, /pki/client4.ovpn, --auth, SHA256]
+  client5:
+    <<: *client
+    depends_on: [server-tls-crypt]
+    command: [client-entrypoint.sh, --config, /pki/client5.ovpn, --proto, tcp-client, --reneg-sec, "15"]
+  client6:
+    <<: *client
+    depends_on: [server-tls-crypt-v2]
+    command: [client-entrypoint.sh, --config, /pki/client6.ovpn]
+  client7:
+    <<: *client25
+    depends_on: [server-tls-crypt-v2]
+    command: [client-entrypoint.sh, --config, /pki/client7.ovpn]
 
   # On the same isolated network as the clients but without a VPN: shows that
   # nothing is reachable from "edge" except through the tunnel.
