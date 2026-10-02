@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
 	"errors"
@@ -14,12 +15,35 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/crypto/blowfish"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // SupportedCiphers are the AEAD data-channel ciphers, in default preference
 // order. They match the OpenVPN 2.6 default data-ciphers.
 var SupportedCiphers = []string{"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}
+
+// CBCCiphers are the legacy (pre-AEAD) ciphers, authenticated with an HMAC
+// using the "auth" digest. They are for old clients and are only used when
+// configured in data-ciphers, data-ciphers-fallback or cipher.
+var CBCCiphers = []string{"AES-256-CBC", "AES-192-CBC", "AES-128-CBC", "BF-CBC"}
+
+// CipherSupported reports whether name is a data-channel cipher softvpn
+// implements, AEAD or CBC.
+func CipherSupported(name string) bool {
+	return inList(name, SupportedCiphers) || inList(name, CBCCiphers)
+}
+
+func inList(name string, list []string) bool {
+	for _, c := range list {
+		if strings.EqualFold(c, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCBC(name string) bool { return inList(name, CBCCiphers) }
 
 func newAEAD(name string, key []byte) (cipher.AEAD, error) {
 	switch strings.ToUpper(name) {
@@ -39,6 +63,22 @@ func newAEAD(name string, key []byte) (cipher.AEAD, error) {
 	return nil, fmt.Errorf("unsupported cipher %q", name)
 }
 
+// newBlock returns the block cipher of a CBC cipher, keyed with the first
+// bytes of key as OpenVPN does (BF-CBC uses its default 128-bit key).
+func newBlock(name string, key []byte) (cipher.Block, error) {
+	switch strings.ToUpper(name) {
+	case "AES-128-CBC":
+		return aes.NewCipher(key[:16])
+	case "AES-192-CBC":
+		return aes.NewCipher(key[:24])
+	case "AES-256-CBC":
+		return aes.NewCipher(key[:32])
+	case "BF-CBC":
+		return blowfish.NewCipher(key[:16])
+	}
+	return nil, fmt.Errorf("unsupported cipher %q", name)
+}
+
 const (
 	keySize      = 128 // one direction: 64 bytes cipher key + 64 bytes HMAC key
 	keyBlockSize = 2 * keySize
@@ -48,25 +88,48 @@ const (
 
 // dataKeys holds both directions of the data channel for one key state.
 type dataKeys struct {
-	send    cipher.AEAD
-	sendIV  [implicitIV]byte
-	sendPID atomic.Uint32
-
+	// AEAD ciphers
+	send   cipher.AEAD
+	sendIV [implicitIV]byte
 	recv   cipher.AEAD
 	recvIV [implicitIV]byte
-	replay replayWindow
+
+	// CBC ciphers, with HMAC
+	sendBlock, recvBlock cipher.Block
+	digest               func() hash.Hash
+	sendMAC, recvMAC     []byte
+
+	sendPID atomic.Uint32
+	replay  replayWindow
 }
 
 // newDataKeys splits a 256-byte key block. key[0] protects client->server
-// traffic and key[1] server->client. For AEAD ciphers the "HMAC" half of
-// each key supplies the implicit part of the nonce.
-func newDataKeys(cipherName string, block []byte) (*dataKeys, error) {
+// traffic and key[1] server->client; each is a 64-byte cipher key followed
+// by a 64-byte HMAC key. For AEAD ciphers the "HMAC" half supplies the
+// implicit part of the nonce; CBC ciphers use it for HMAC with the "auth"
+// digest.
+func newDataKeys(cipherName, auth string, block []byte) (*dataKeys, error) {
 	if len(block) != keyBlockSize {
 		return nil, errors.New("bad key block size")
 	}
 	c2s, s2c := block[:keySize], block[keySize:]
 	d := &dataKeys{}
 	var err error
+	if isCBC(cipherName) {
+		if d.digest, err = DigestFunc(auth); err != nil {
+			return nil, err
+		}
+		if d.recvBlock, err = newBlock(cipherName, c2s[:64]); err != nil {
+			return nil, err
+		}
+		if d.sendBlock, err = newBlock(cipherName, s2c[:64]); err != nil {
+			return nil, err
+		}
+		n := d.digest().Size()
+		d.recvMAC = append([]byte(nil), c2s[64:64+n]...)
+		d.sendMAC = append([]byte(nil), s2c[64:64+n]...)
+		return d, nil
+	}
 	if d.recv, err = newAEAD(cipherName, c2s[:64]); err != nil {
 		return nil, err
 	}
@@ -91,6 +154,9 @@ func nonce(pid []byte, iv [implicitIV]byte) []byte {
 //
 // The additional data is hdr||packet-id for V2 and packet-id alone for V1.
 func (d *dataKeys) seal(hdr, plaintext []byte) []byte {
+	if d.sendBlock != nil {
+		return d.sealCBC(hdr, plaintext)
+	}
 	pid := d.sendPID.Add(1)
 	out := make([]byte, 0, len(hdr)+4+tagSize+len(plaintext))
 	out = append(out, hdr...)
@@ -110,6 +176,9 @@ var errAuth = errors.New("data packet authentication failed")
 
 // open authenticates and decrypts a data packet whose header is hdrLen bytes.
 func (d *dataKeys) open(pkt []byte, hdrLen int) ([]byte, error) {
+	if d.recvBlock != nil {
+		return d.openCBC(pkt, hdrLen)
+	}
 	if len(pkt) < hdrLen+4+tagSize {
 		return nil, errShort
 	}
@@ -130,6 +199,68 @@ func (d *dataKeys) open(pkt []byte, hdrLen int) ([]byte, error) {
 		return nil, errors.New("replayed data packet")
 	}
 	return pt, nil
+}
+
+// sealCBC is the non-AEAD data channel format:
+//
+//	hdr | HMAC(IV || ciphertext) | IV | CBC(packet-id (4) || plaintext || PKCS#7 padding)
+//
+// Unlike the AEAD format, the opcode and peer id are not authenticated.
+func (d *dataKeys) sealCBC(hdr, plaintext []byte) []byte {
+	bs := d.sendBlock.BlockSize()
+	macLen := len(d.sendMAC)
+	n := 4 + len(plaintext)
+	pad := bs - n%bs
+	out := make([]byte, len(hdr)+macLen+bs+n+pad)
+	copy(out, hdr)
+	iv := out[len(hdr)+macLen : len(hdr)+macLen+bs]
+	if _, err := rand.Read(iv); err != nil {
+		panic(err)
+	}
+	body := out[len(hdr)+macLen+bs:]
+	binary.BigEndian.PutUint32(body, d.sendPID.Add(1))
+	copy(body[4:], plaintext)
+	for i := n; i < len(body); i++ {
+		body[i] = byte(pad)
+	}
+	cipher.NewCBCEncrypter(d.sendBlock, iv).CryptBlocks(body, body)
+	mac := hmac.New(d.digest, d.sendMAC)
+	mac.Write(out[len(hdr)+macLen:])
+	copy(out[len(hdr):], mac.Sum(nil))
+	return out
+}
+
+func (d *dataKeys) openCBC(pkt []byte, hdrLen int) ([]byte, error) {
+	bs := d.recvBlock.BlockSize()
+	macLen := len(d.recvMAC)
+	if len(pkt) < hdrLen+macLen+2*bs {
+		return nil, errShort
+	}
+	mac := hmac.New(d.digest, d.recvMAC)
+	mac.Write(pkt[hdrLen+macLen:])
+	if !hmac.Equal(mac.Sum(nil), pkt[hdrLen:hdrLen+macLen]) {
+		return nil, errAuth
+	}
+	iv := pkt[hdrLen+macLen : hdrLen+macLen+bs]
+	ct := pkt[hdrLen+macLen+bs:]
+	if len(ct)%bs != 0 {
+		return nil, errors.New("CBC ciphertext is not a whole number of blocks")
+	}
+	pt := make([]byte, len(ct))
+	cipher.NewCBCDecrypter(d.recvBlock, iv).CryptBlocks(pt, ct)
+	pad := int(pt[len(pt)-1])
+	if pad == 0 || pad > bs || pad > len(pt)-4 {
+		return nil, errors.New("bad CBC padding")
+	}
+	for _, b := range pt[len(pt)-pad:] {
+		if int(b) != pad {
+			return nil, errors.New("bad CBC padding")
+		}
+	}
+	if !d.replay.accept(binary.BigEndian.Uint32(pt)) {
+		return nil, errors.New("replayed data packet")
+	}
+	return pt[4 : len(pt)-pad], nil
 }
 
 // replayWindow is a 64-packet sliding window over data-channel packet ids.

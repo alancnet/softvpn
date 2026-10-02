@@ -3,7 +3,8 @@
 An OpenVPN-compatible VPN server that runs entirely in userspace. It needs no
 TUN device, no iptables, no `NET_ADMIN`, and no root, so it runs in a fully
 locked-down Docker container (`cap_drop: [ALL]`, non-root, read-only root
-filesystem). Stock OpenVPN clients (2.5 and 2.6) connect to it unmodified.
+filesystem). Stock OpenVPN clients (2.5 and 2.6, and older ones over CBC
+ciphers) connect to it unmodified.
 
 Routing and NAT happen inside the process:
 
@@ -189,7 +190,7 @@ startup with a pointer to these directives.
 ## End-to-end test
 
 ```sh
-test/run.sh            # builds, runs 86 checks, tears down
+test/run.sh            # builds, runs 99 checks, tears down
 KEEP=1 test/run.sh     # leave it running afterwards
 ```
 
@@ -211,6 +212,11 @@ KEEP=1 test/run.sh     # leave it running afterwards
 | `tlscryptv2-client`, `tlscryptv2-client25` | `edge` only | `tls-crypt-v2` with OpenVPN 2.6 and 2.5 |
 | `siteclient` | `edge` + `lan` | stock OpenVPN 2.6; site gateway for `lan` (`iroute`, `iroute-ipv6`), forwarding enabled |
 | `lansvc` | `lan` only | a host on siteclient's LAN, with a route back to the VPN via siteclient |
+| `cbc-lz4-client` | `edge` only | OpenVPN 2.6 over TCP offering only AES-256-CBC (HMAC-SHA256); `compress lz4` |
+| `fallback-lzo-client` | `edge` only | OpenVPN 2.5 with `--ncp-disable`: gets `data-ciphers-fallback` AES-128-CBC; `comp-lzo yes` |
+| `lz4v2-client` | `edge` only | OpenVPN 2.6 with `compress lz4-v2` |
+| `stubv2-client` | `edge` only | OpenVPN 2.6 with `compress stub-v2`, which the server doesn't configure (migrated) |
+| `openvpn23-client` | `edge` only | OpenVPN 2.3.18: no cipher negotiation, AES-256-CBC, `comp-lzo` |
 | `probe` | `edge` only | no VPN; proves `edge` can't reach anything by itself |
 | `tapserver` | `wan` + `tapedge` | softvpn with `dev tap` and `server-bridge` ([server-tap.conf](test/server-tap.conf)); locked down like `server` |
 | `tapclient1` | `tapedge` only | stock OpenVPN 2.6 with `dev tap` over UDP |
@@ -252,7 +258,14 @@ and is NATed by its server, that clients with the wrong HMAC digest, no key,
 or a tls-crypt-v2 key from another server are refused, that a tls-crypt-v2
 client key made by the stock `openvpn --genkey` from softvpn's server key is
 accepted, and renegotiation over tls-crypt; all of those keys and profiles
-come from softvpn's own generator (the `pki-tls-*` containers).
+come from softvpn's own generator (the `pki-tls-*` containers). Older clients and
+compression: CBC ciphers negotiated, taken from an old client's options, or
+used as the fallback (OpenVPN 2.6, 2.5 and 2.3 clients); uploads of
+compressible data that the clients compress with LZ4, LZ4-v2, and LZO must
+reach the web server byte for byte (it checks a SHA-256), and with
+`allow-compression yes` the server's LZ4-compressed downloads must decompress
+in the clients. The clients' own OpenVPN statistics confirm that compression
+happened.
 
 No container is privileged. The OpenVPN *clients* get `/dev/net/tun` and the
 single capability `NET_ADMIN`, because the stock client always creates a
@@ -289,6 +302,29 @@ neither.
 - Data channel: AES-256-GCM, AES-128-GCM, and CHACHA20-POLY1305, negotiated
   via `data-ciphers`; P_DATA_V2 with peer-id and client floating; 64-packet
   replay window.
+- CBC ciphers for older clients: AES-256-CBC, AES-192-CBC, AES-128-CBC, and
+  BF-CBC, authenticated with HMAC using the `auth` digest (SHA1, the default,
+  SHA224, SHA256, SHA384, SHA512). They are never offered by default. A
+  client gets one when it is in `data-ciphers` and the client lists it, when
+  a client that can't negotiate (OpenVPN 2.3, or `--ncp-disable`) has it as
+  its `cipher` and it is in `data-ciphers`, or from `data-ciphers-fallback`
+  for clients that can't negotiate. As in OpenVPN 2.6, `cipher` on the server
+  acts as the fallback when it isn't in `data-ciphers`. `auth` isn't
+  negotiated: it must match the clients'.
+- Compression: `compress` (`stub`, `stub-v2`, `lz4`, `lz4-v2`, `lzo`,
+  `migrate`) and `comp-lzo` (`yes`, `no`, `adaptive`) in `server.conf` or in a
+  client's `client-config-dir` file, with OpenVPN's framing for each. The
+  setting is pushed to the client (the comp-lzo spelling for OpenVPN 2.3),
+  unless you already `push` a `compress`/`comp-lzo` option, in which case
+  that option sets the framing instead. A client that has compression enabled
+  while the server configures none is migrated to framing without
+  compression (`compress stub-v2`, or `comp-lzo no` for 2.3), like OpenVPN's
+  `compress migrate`. `allow-compression` follows OpenVPN 2.6: `asym` (the
+  default) decompresses LZ4 and LZO from clients but never compresses what it
+  sends; `yes` also compresses outgoing packets with LZ4 (LZO framing is
+  always sent uncompressed); `no` allows only the stub framings and drops
+  compressed packets. Compressing outgoing traffic makes VORACLE-style
+  attacks possible, so leave it at `asym` unless you need it.
 - Key derivation: `tls-ekm` (RFC 5705, OpenVPN 2.6) and the legacy OpenVPN
   PRF (2.5).
 - Client-initiated renegotiation (`reneg-sec`), with a 60 s overlap during
@@ -344,15 +380,17 @@ softvpn doesn't implement are rejected at startup.
 
 - `tls-crypt-v2-verify` and `tls-crypt-v2-max-age`: client key metadata is
   not checked.
-- Compression (`compress`, `comp-lzo`): clients must not enable it.
 - Plugins and scripts (`plugin`, `auth-user-pass-verify`, `client-connect`,
   ...): use the built-in user database instead. Deferred authentication,
   `crl-verify DIR dir`, and `auth-gen-token`'s renewal window and
   `external-auth` aren't supported.
-- CBC ciphers for pre-2.4 clients.
 - IPv6-only clients (every client gets an IPv4 address) and NAT64.
 - In TAP mode: a client bridging a LAN behind it (more than one MAC per
   client), IPv6 (`server-ipv6`), `route`/`iroute`, and VLAN tags.
+- OpenVPN 2.3 clients with `remote-cert-tls server` reject the ECDSA server
+  certificates `softvpn pki` issues (2.3 expects RSA key usage); add
+  `remote-cert-ku 80` to their profile or use an RSA certificate. Snappy
+  compression isn't implemented.
 
 ## Layout
 

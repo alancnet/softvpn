@@ -83,7 +83,7 @@ services:
     network_mode: none
     volumes: [pki:/pki]
     # -shared: clients run as a different uid; demo volume only.
-    command: [pki, init, -dir, /pki, -clients, "client1,client2,client3,siteclient,revoked,tapclient1,tapclient2,tapclient3", -remote, server, -shared]
+    command: [pki, init, -dir, /pki, -clients, "client1,client2,client3,siteclient,revoked,tapclient1,tapclient2,tapclient3,cbc-lz4-client,fallback-lzo-client,lz4v2-client,stubv2-client,openvpn23-client", -remote, server, -shared]
 
   # The image has no shell, so each further setup step is its own one-shot
   # container: revoke a certificate (writes /pki/crl.pem, which the server
@@ -336,6 +336,50 @@ services:
     <<: *client25
     depends_on: [tlscryptv2-server]
     command: [client-entrypoint.sh, --config, /pki/tlscryptv2-client25.ovpn]
+
+  # Legacy data channel: OpenVPN 2.6 over TCP that only offers AES-256-CBC
+  # (HMAC-SHA256), with "compress lz4" (swap framing, set for this client in
+  # client-config-dir) compressing in both directions.
+  cbc-lz4-client:
+    <<: *client
+    command: [client-entrypoint.sh, --config, /pki/cbc-lz4-client.ovpn, --proto, tcp-client,
+              --data-ciphers, AES-256-CBC, --auth, SHA256,
+              --compress, lz4, --allow-compression, "yes"]
+
+  # OpenVPN 2.5 that cannot negotiate a cipher, so the server falls back to
+  # data-ciphers-fallback (AES-128-CBC); compresses with comp-lzo.
+  fallback-lzo-client:
+    <<: *client
+    build: { context: ./tools, args: { ALPINE: "3.17" } }
+    image: softvpn-test-tools${SVT_ID:-}:openvpn-2.5
+    command: [client-entrypoint.sh, --config, /pki/fallback-lzo-client.ovpn, --ncp-disable,
+              --cipher, AES-128-CBC, --auth, SHA256,
+              --comp-lzo, "yes", --allow-compression, "yes"]
+
+  # "compress lz4-v2", compressing in both directions.
+  lz4v2-client:
+    <<: *client
+    command: [client-entrypoint.sh, --config, /pki/lz4v2-client.ovpn,
+              --compress, lz4-v2, --allow-compression, "yes"]
+
+  # "compress stub-v2" with nothing configured for it on the server: softvpn
+  # migrates it (pushes stub-v2), like OpenVPN's "compress migrate".
+  stubv2-client:
+    <<: *client
+    command: [client-entrypoint.sh, --config, /pki/stubv2-client.ovpn, --compress, stub-v2]
+
+  # OpenVPN 2.3 (2017 build): no cipher negotiation and no "compress", only
+  # comp-lzo. The server takes AES-256-CBC from its options string and
+  # migrates it to "comp-lzo no". 2.3's remote-cert-tls wants keyEncipherment
+  # in the server certificate (ECDSA certificates have digitalSignature), and
+  # it finds no default gateway to redirect on "edge", so it routes "wan".
+  openvpn23-client:
+    <<: *client
+    build: { context: ./tools, args: { ALPINE: "3.5" } }
+    image: softvpn-test-tools${SVT_ID:-}:openvpn-2.3
+    command: [client-entrypoint.sh, --config, /pki/openvpn23-client.ovpn,
+              --cipher, AES-256-CBC, --auth, SHA256, --comp-lzo, --remote-cert-ku, "80",
+              --route, "${SVT_NET:-10.231}.10.0", 255.255.255.0]
 
   # On the same isolated network as the clients but without a VPN: shows that
   # nothing is reachable from "edge" except through the tunnel.

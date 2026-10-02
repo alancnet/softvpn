@@ -122,11 +122,15 @@ func (s *Server) Run(ctx context.Context) error {
 	engine := ovpn.NewServer(ovpn.Options{
 		TLS:             tlsConf,
 		Ciphers:         s.cfg.Ciphers,
+		CipherFallback:  s.cfg.CipherFallback,
+		Digest:          s.cfg.Digest,
 		PingInterval:    s.cfg.PingInterval,
 		PingTimeout:     2 * s.cfg.PingTimeout, // OpenVPN doubles the server side
 		PushPing:        s.cfg.PingInterval,
 		PushPingRestart: s.cfg.PingTimeout,
 		Wrap:            s.cfg.Wrap,
+
+		AllowCompression: s.cfg.AllowCompression,
 	}, s, s.log)
 	if w := s.cfg.Wrap; w != nil {
 		s.log.Info("control channel protected", "mode", w.Mode)
@@ -266,6 +270,10 @@ func (s *Server) Connect(ss *ovpn.Session) (*ovpn.Assignment, error) {
 		if s.cfg.NoGateway {
 			a.Gateway = netip.Addr{}
 		}
+	}
+	a.Compress = s.cfg.Compress
+	if cc.Compress != ovpn.CompressUnset {
+		a.Compress = cc.Compress
 	}
 	return a, nil
 }

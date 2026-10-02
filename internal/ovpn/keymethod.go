@@ -125,19 +125,42 @@ const (
 	ivProtoCCExitNotify = 1 << 7
 )
 
-// negotiateCipher picks the first server cipher the client also supports.
-func negotiateCipher(server []string, pi peerInfo) (string, bool) {
+// negotiateCipher picks the first server cipher the client also supports,
+// as OpenVPN 2.6 does: the client's IV_CIPHERS (AES-GCM for IV_NCP=2), or
+// the cipher in its OCC options string ("poor man's NCP" for clients that
+// can't negotiate). Failing that, a client that cannot negotiate gets fallback
+// (data-ciphers-fallback), which may be "". It reports whether to push the
+// cipher: only when it was negotiated with a client that supports it.
+func negotiateCipher(server []string, pi peerInfo, occCipher, fallback string) (string, bool) {
 	var client []string
 	if c := pi["IV_CIPHERS"]; c != "" {
 		client = strings.Split(c, ":")
 	} else if ncp, _ := strconv.Atoi(pi["IV_NCP"]); ncp >= 2 {
 		client = []string{"AES-256-GCM", "AES-128-GCM"}
 	}
+	ncp := len(client) > 0
+	if occCipher != "" {
+		client = append(client, occCipher)
+	}
 	for _, s := range server {
 		for _, c := range client {
 			if strings.EqualFold(s, c) {
-				return strings.ToUpper(s), true
+				return strings.ToUpper(s), ncp
 			}
+		}
+	}
+	if fallback != "" && !ncp {
+		return strings.ToUpper(fallback), false
+	}
+	return "", false
+}
+
+// occOption finds "name [value]" in an OCC options string such as
+// "V4,dev-type tun,...,cipher AES-256-CBC,auth SHA1,...".
+func occOption(options, name string) (string, bool) {
+	for _, f := range strings.Split(options, ",") {
+		if k, v, _ := strings.Cut(f, " "); k == name {
+			return v, true
 		}
 	}
 	return "", false

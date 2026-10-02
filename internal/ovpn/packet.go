@@ -4,7 +4,8 @@
 // Every OpenVPN packet starts with one byte holding a 5-bit opcode and a
 // 3-bit key id. Control packets carry a session id, an ACK list and a
 // message id for the reliability layer, followed by a fragment of the TLS
-// byte stream. Data packets carry AEAD-encrypted IP packets.
+// byte stream. Data packets carry IP packets, AEAD-encrypted (or CBC with
+// HMAC for old clients) and optionally in OpenVPN's compression framing.
 package ovpn
 
 import (

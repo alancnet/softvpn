@@ -62,7 +62,8 @@ fi
 
 echo "==> waiting for the clients to finish connecting"
 for c in client1 client2 client3 client4 siteclient tapclient1 tapclient2 tapclient3 \
-    tlsauth-client tlscrypt-client tlscryptv2-client tlscryptv2-client25; do
+    tlsauth-client tlscrypt-client tlscryptv2-client tlscryptv2-client25 \
+    cbc-lz4-client fallback-lzo-client lz4v2-client stubv2-client openvpn23-client; do
   for _ in $(seq 1 30); do
     dc logs "$c" 2>/dev/null | grep -q "Initialization Sequence Completed" && break
     sleep 1
@@ -141,6 +142,68 @@ if t=$(x client1 curl -s -m 60 -o /dev/null -w '%{size_download} %{speed_downloa
 else
   bad "50 MB download" "$t"
 fi
+
+echo "==> CBC ciphers for older clients"
+connected() { srvlog | grep 'client connected' | grep "client=$1 " | tail -1; }
+line=$(connected cbc-lz4-client)
+echo "$line" | grep -q 'remote=tcp:' && echo "$line" | grep -q 'cipher=AES-256-CBC' && echo "$line" | grep -q 'auth=SHA256' &&
+  ok "cbc-lz4-client (OpenVPN 2.6, TCP) negotiated AES-256-CBC with HMAC-SHA256 via data-ciphers" || bad "cbc-lz4-client negotiation (AES-256-CBC over TCP)" "$line"
+line=$(connected fallback-lzo-client)
+echo "$line" | grep -q 'version=2.5' && echo "$line" | grep -q 'cipher=AES-128-CBC' &&
+  ok "fallback-lzo-client (OpenVPN 2.5, --ncp-disable) got data-ciphers-fallback AES-128-CBC" || bad "fallback-lzo-client negotiation (fallback cipher)" "$line"
+line=$(connected openvpn23-client)
+echo "$line" | grep -q 'version=2.3' && echo "$line" | grep -q 'cipher=AES-256-CBC' && echo "$line" | grep -q 'compress="comp-lzo no"' &&
+  ok "openvpn23-client: OpenVPN $(echo "$line" | sed -n 's/.*version=\([^ ]*\).*/\1/p') (no negotiation): AES-256-CBC from its options, migrated to comp-lzo no" || bad "openvpn23-client negotiation (2.3 client)" "$line"
+for c in cbc-lz4-client fallback-lzo-client openvpn23-client; do
+  out=$(x $c curl -s -m 5 http://$WEB/ 2>&1)
+  echo "$out" | grep -q "you are $SRV_WAN" && ok "$c -> web through NAT over CBC" || bad "$c -> web over CBC" "$out"
+done
+t=$(x fallback-lzo-client curl -s -m 60 -o /dev/null -w '%{size_download} %{speed_download}' http://$WEB:81/ 2>&1)
+read -r size speed <<<"$t"
+[ "$size" = 50000000 ] && ok "fallback-lzo-client: 50 MB download over AES-128-CBC/UDP intact ($(awk "BEGIN{printf \"%.1f\", $speed*8/1e6}") Mbit/s)" || bad "fallback-lzo-client 50 MB download over CBC" "$t"
+
+echo "==> compression"
+# counters SVC: the client's own pre/post-compress and pre/post-decompress
+# byte counts, from the statistics OpenVPN logs on SIGUSR2.
+counters() {
+  x "$1" pkill -USR2 openvpn
+  sleep 1
+  dc logs --no-log-prefix "$1" 2>/dev/null | awk -F, '
+    /pre-compress bytes,/ {v[1] = $2} /post-compress bytes,/ {v[2] = $2}
+    /pre-decompress bytes,/ {v[3] = $2} /post-decompress bytes,/ {v[4] = $2}
+    END {print v[1] + 0, v[2] + 0, v[3] + 0, v[4] + 0}'
+}
+mb() { awk "BEGIN{printf \"%.1f MB\", $1/1e6}"; }
+# Upload ~2 MB of text: the client compresses it and the server must
+# decompress it exactly (the web server answers with the SHA-256 it got).
+for c in lz4v2-client:lz4-v2 cbc-lz4-client:lz4 fallback-lzo-client:"comp-lzo yes"; do
+  svc=${c%%:*} algo=${c#*:}
+  line=$(connected $svc)
+  read -r pre0 post0 _ _ < <(counters $svc)
+  out=$(x $svc sh -c "seq 1 300000 > /tmp/up && sha256sum < /tmp/up && socat -t 10 - TCP:$WEB:82 < /tmp/up" 2>&1)
+  read -r pre post _ _ < <(counters $svc)
+  pre=$((pre - pre0)) post=$((post - post0))
+  sums=$(echo "$out" | awk '{print $1}' | sort -u | wc -l)
+  if echo "$line" | grep -q "compress=\"compress $algo\"\|compress=\"$algo\"" && [ "$(echo "$out" | wc -l)" = 2 ] && [ "$sums" = 1 ] &&
+    [ "$post" -gt 0 ] && [ "$post" -lt $((pre * 3 / 4)) ]; then
+    ok "$svc ($algo): upload compressed by the client ($(mb $pre) -> $(mb $post)), decompressed by the server intact"
+  else
+    bad "$svc ($algo) compressed upload" "$line / $out / pre=$pre post=$post"
+  fi
+done
+# allow-compression yes: the server compresses what it sends, with LZ4.
+for svc in lz4v2-client cbc-lz4-client; do
+  read -r _ _ pre0 post0 < <(counters $svc)
+  t=$(x $svc curl -s -m 60 -o /dev/null -w '%{size_download}' http://$WEB:81/ 2>&1)
+  read -r _ _ pre post < <(counters $svc)
+  pre=$((pre - pre0)) post=$((post - post0))
+  [ "$t" = 50000000 ] && [ "$pre" -gt 0 ] && [ "$pre" -lt $((post / 4)) ] &&
+    ok "$svc: 50 MB download compressed by the server ($(mb $post) arrived as $(mb $pre)), intact" || bad "$svc server-compressed download" "size=$t pre=$pre post=$post"
+done
+line=$(connected stubv2-client)
+out=$(x stubv2-client curl -s -m 5 http://$WEB/ 2>&1)
+echo "$line" | grep -q 'compress="compress stub-v2"' && echo "$out" | grep -q "you are $SRV_WAN" &&
+  ok "stubv2-client (compress stub-v2, nothing configured on the server) migrated and passes traffic" || bad "stubv2-client stub-v2 migration" "$line / $out"
 
 echo "==> real internet via the server's default gateway (optional)"
 ip=$(x client1 dig +short +time=3 +tries=1 @10.8.0.1 example.com A 2>/dev/null | grep -E '^[0-9.]+$' | head -1)

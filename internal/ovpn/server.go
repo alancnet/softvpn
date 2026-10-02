@@ -23,6 +23,10 @@ type Options struct {
 	PushPingRestart time.Duration // pushed "ping-restart"
 	HandshakeWindow time.Duration
 	Wrap            *ControlWrap // tls-auth / tls-crypt / tls-crypt-v2; nil for none
+
+	CipherFallback   string // data-ciphers-fallback, for clients that cannot negotiate
+	Digest           string // "auth": HMAC digest for CBC ciphers, default SHA1
+	AllowCompression AllowCompression
 }
 
 // Server accepts OpenVPN clients over UDP and/or TCP.
@@ -40,6 +44,9 @@ type Server struct {
 func NewServer(opt Options, h Handler, log *slog.Logger) *Server {
 	if len(opt.Ciphers) == 0 {
 		opt.Ciphers = SupportedCiphers
+	}
+	if opt.Digest == "" {
+		opt.Digest = "SHA1"
 	}
 	if opt.HandshakeWindow == 0 {
 		opt.HandshakeWindow = 60 * time.Second
