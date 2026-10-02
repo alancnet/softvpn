@@ -2,6 +2,6 @@
 # Also used for the "web" target and the no-VPN "probe" container.
 ARG ALPINE=3.20
 FROM alpine:${ALPINE}
-RUN apk add --no-cache openvpn curl bind-tools iputils socat
+RUN apk add --no-cache openvpn curl bind-tools iputils socat jq
 COPY client-entrypoint.sh web.sh http-reply.sh dhcp-script.sh /usr/local/bin/
 ENTRYPOINT []

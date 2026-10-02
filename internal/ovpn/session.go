@@ -158,6 +158,29 @@ func (s *Session) Certificate() *x509.Certificate {
 // PeerInfo returns an IV_* value the client sent (e.g. "IV_VER").
 func (s *Session) PeerInfo(key string) string { return s.pi[key] }
 
+// SessionInfo is a snapshot of a session for status displays.
+type SessionInfo struct {
+	PeerID   uint32
+	Since    time.Time // when the client's first packet arrived
+	Cipher   string    // data-channel cipher
+	Version  string    // IV_VER: the client's OpenVPN version
+	Platform string    // IV_PLAT
+	GUI      string    // IV_GUI_VER
+	Compress string    // compression framing, "" for none
+}
+
+// Info returns a snapshot of the session's negotiated parameters.
+func (s *Session) Info() SessionInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := SessionInfo{PeerID: s.peerID, Since: s.created, Cipher: s.cipher,
+		Version: s.pi["IV_VER"], Platform: s.pi["IV_PLAT"], GUI: s.pi["IV_GUI_VER"]}
+	if s.comp.mode != CompressUnset {
+		i.Compress = s.comp.mode.String()
+	}
+	return i
+}
+
 // Remote is the client's transport address.
 func (s *Session) Remote() string { return s.tr.remote() }
 
@@ -186,12 +209,18 @@ func (s *Session) Close(reason string) {
 // session. msg is an OpenVPN control message: "AUTH_FAILED,reason" makes a
 // stock client stop; "RESTART" makes it reconnect.
 func (s *Session) Kick(msg, reason string) {
+	s.Notify(msg)
+	time.AfterFunc(2*time.Second, func() { s.Close(reason) })
+}
+
+// Notify sends the client a control message, such as "RESTART" (reconnect)
+// or "HALT" (exit), without waiting for it to arrive.
+func (s *Session) Notify(msg string) {
 	if ks := s.primary.Load(); ks != nil {
 		if conn := ks.conn.Load(); conn != nil {
-			conn.Write([]byte(msg + "\x00"))
+			go conn.Write([]byte(msg + "\x00"))
 		}
 	}
-	time.AfterFunc(2*time.Second, func() { s.Close(reason) })
 }
 
 // newKeyState must be called with s.mu held (or before the session is shared).
@@ -467,8 +496,8 @@ func (s *Session) runKey(ks *keyState) {
 		}
 		s.mu.Lock()
 		s.assign = a
-		s.mu.Unlock()
 		s.setCompression(a)
+		s.mu.Unlock()
 		// Hold the first keepalive back a full interval: the client cannot
 		// decrypt until it has processed our key exchange message.
 		s.lastDataSent.Store(time.Now().UnixNano())

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,6 +28,12 @@ var directives = []string{
 	"cipher", "data-ciphers-fallback", "compress", "comp-lzo", "allow-compression",
 	// softvpn extensions
 	"upstream-dns", "nat-allow", "nat-deny",
+}
+
+// WebUIDirectives configure the optional web interface (package webui). The
+// server accepts them so they can live in server.conf.
+var WebUIDirectives = []string{
+	"web-ui", "web-ui-cert", "web-ui-key", "web-ui-http", "web-ui-users", "web-ui-pki", "web-ui-remote",
 }
 
 // Directives that only make sense for a kernel-based OpenVPN, accepted so an
@@ -93,7 +100,8 @@ func Load(c *config.Config) (*Config, error) {
 	if err := rejectScripts(c); err != nil {
 		return nil, err
 	}
-	if err := c.Check(append(append(directives, authDirectives...), ignored...)...); err != nil {
+	known := append(append(append([]string(nil), directives...), authDirectives...), WebUIDirectives...)
+	if err := c.Check(append(known, ignored...)...); err != nil {
 		return nil, err
 	}
 	cfg := &Config{
@@ -102,7 +110,9 @@ func Load(c *config.Config) (*Config, error) {
 		PingInterval:   10 * time.Second,
 		PingTimeout:    60 * time.Second,
 		StatusInterval: 60 * time.Second,
-		CCDDir:         c.String("client-config-dir", ""),
+	}
+	if d, ok := c.Last("client-config-dir"); ok {
+		cfg.CCDDir = d.Path(0) // relative to server.conf, like ca/cert/key
 	}
 	var err error
 	if cfg.Verb, err = c.Int("verb", 1); err != nil {
@@ -514,10 +524,10 @@ type clientConfig struct {
 
 func (cfg *Config) loadCCD(cn string) (*clientConfig, error) {
 	cc := &clientConfig{}
-	if cfg.CCDDir == "" || cn == "" || strings.ContainsAny(cn, "/\\") || cn[0] == '.' {
+	if cfg.CCDDir == "" || !ValidCCDName(cn) {
 		return cc, nil
 	}
-	path := cfg.CCDDir + "/" + cn
+	path := filepath.Join(cfg.CCDDir, cn)
 	if _, err := os.Stat(path); err != nil {
 		return cc, nil
 	}
@@ -525,6 +535,32 @@ func (cfg *Config) loadCCD(cn string) (*clientConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	return cfg.parseCCD(c, path)
+}
+
+// CheckCCD validates text as the client-config-dir file for client name,
+// as the server would read it.
+func (cfg *Config) CheckCCD(name, text string) error {
+	if !ValidCCDName(name) {
+		return fmt.Errorf("invalid client name %q", name)
+	}
+	path := filepath.Join(cfg.CCDDir, name)
+	c, err := config.ParseText(path, text)
+	if err != nil {
+		return err
+	}
+	_, err = cfg.parseCCD(c, path)
+	return err
+}
+
+// ValidCCDName reports whether name can have a client-config-dir file.
+func ValidCCDName(name string) bool {
+	return name != "" && !strings.ContainsAny(name, "/\\\x00") && name[0] != '.'
+}
+
+func (cfg *Config) parseCCD(c *config.Config, path string) (*clientConfig, error) {
+	cc := &clientConfig{}
+	var err error
 	if err := c.Check("ifconfig-push", "ifconfig-ipv6-push", "push", "push-reset", "disable", "iroute", "iroute-ipv6",
 		"compress", "comp-lzo"); err != nil {
 		return nil, err

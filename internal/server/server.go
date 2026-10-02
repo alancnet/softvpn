@@ -33,6 +33,15 @@ type Server struct {
 	pinger *pinger
 	bridge *bridge // TAP mode only
 
+	// Set by Start.
+	started   time.Time
+	listening []Listening
+	stop      context.CancelFunc
+	errc      chan error // one result per listener
+	cleanup   func()     // stops the listeners and waits for them
+	done      chan struct{}
+	err       error // why it stopped, once done is closed
+
 	mu       sync.RWMutex
 	pool     *pool
 	routes   *routes
@@ -93,13 +102,47 @@ func New(cfg *Config, log *slog.Logger) (*Server, error) {
 	return s, nil
 }
 
+// Listening is a socket the server accepts clients on.
+type Listening struct {
+	Proto string // "udp", "udp4", "tcp" or "tcp4"
+	Addr  string // the bound address
+}
+
 // Run serves until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
-	st, err := vnet.New(s.cfg.MTU, s.deliver)
-	if err != nil {
+	if err := s.Start(ctx); err != nil {
 		return err
 	}
-	defer st.Close()
+	return s.Wait()
+}
+
+// Start brings up the virtual network and opens the listeners. It returns
+// once clients can connect, or with an error (a port in use, say), in which
+// case nothing is left running. The server then runs until ctx is cancelled
+// or a listener fails; Wait waits for that. A Server is started at most
+// once.
+func (s *Server) Start(ctx context.Context) (err error) {
+	ctx, s.stop = context.WithCancel(ctx)
+	st, err := vnet.New(s.cfg.MTU, s.deliver)
+	if err != nil {
+		s.stop()
+		return err
+	}
+	s.errc = make(chan error, len(s.cfg.Listeners))
+	s.done = make(chan struct{})
+	running := 0 // listeners serving, each of which sends to errc when done
+	s.cleanup = func() {
+		s.stop()
+		for ; running > 0; running-- {
+			<-s.errc
+		}
+		st.Close()
+	}
+	defer func() {
+		if err != nil {
+			s.cleanup()
+		}
+	}()
 	nat := vnet.NATOptions{
 		Gateway: netip.PrefixFrom(s.cfg.Gateway, s.cfg.Subnet.Bits()),
 		Policy:  s.policy,
@@ -136,7 +179,6 @@ func (s *Server) Run(ctx context.Context) error {
 		s.log.Info("control channel protected", "mode", w.Mode)
 	}
 
-	errc := make(chan error, len(s.cfg.Listeners))
 	for _, l := range s.cfg.Listeners {
 		switch l.Proto {
 		case "udp":
@@ -151,16 +193,21 @@ func (s *Server) Run(ctx context.Context) error {
 			conn.SetReadBuffer(4 << 20)
 			conn.SetWriteBuffer(4 << 20)
 			s.log.Info("listening", "proto", l.Network, "addr", conn.LocalAddr())
-			go func() { errc <- engine.ServeUDP(ctx, conn) }()
+			s.listening = append(s.listening, Listening{l.Network, conn.LocalAddr().String()})
+			running++
+			go func() { s.errc <- engine.ServeUDP(ctx, conn) }()
 		case "tcp":
 			ln, err := net.Listen(l.Network, l.Addr)
 			if err != nil {
 				return err
 			}
 			s.log.Info("listening", "proto", l.Network, "addr", ln.Addr())
-			go func() { errc <- engine.ServeTCP(ctx, ln) }()
+			s.listening = append(s.listening, Listening{l.Network, ln.Addr().String()})
+			running++
+			go func() { s.errc <- engine.ServeTCP(ctx, ln) }()
 		}
 	}
+	s.started = time.Now()
 	attrs := []any{"subnet", s.cfg.Subnet, "gateway", s.cfg.Gateway}
 	if s.cfg.Subnet6.IsValid() {
 		attrs = append(attrs, "subnet6", s.cfg.Subnet6, "gateway6", s.cfg.Gateway6)
@@ -181,17 +228,35 @@ func (s *Server) Run(ctx context.Context) error {
 			"users", s.cfg.Auth.Users != nil, "crl", s.cfg.Auth.CRL != nil, "auth_gen_token", s.cfg.Auth.AuthGenToken)
 		go s.authWatch(ctx)
 	}
+	go func() {
+		// The first listener to return (normally because ctx is done)
+		// stops the others.
+		err := <-s.errc
+		running--
+		s.cleanup()
+		s.mu.RLock()
+		for ss := range s.sessions {
+			go ss.Close("server shutting down")
+		}
+		s.mu.RUnlock()
+		s.err = err
+		close(s.done)
+	}()
+	return nil
+}
 
-	select {
-	case <-ctx.Done():
-	case err = <-errc:
-	}
-	s.mu.RLock()
-	for ss := range s.sessions {
-		go ss.Close("server shutting down")
-	}
-	s.mu.RUnlock()
-	return err
+// Wait waits until the server started by Start has stopped: every listener
+// is closed and every session told to end. It returns the error that
+// stopped it, or nil if its context was cancelled.
+func (s *Server) Wait() error {
+	<-s.done
+	return s.err
+}
+
+// Stop stops a started server and waits until it has stopped.
+func (s *Server) Stop() error {
+	s.stop()
+	return s.Wait()
 }
 
 // Connect implements ovpn.Handler: it authorises a client and assigns its

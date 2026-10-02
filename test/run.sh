@@ -24,6 +24,9 @@ for f in ccd/*; do
   sed -e "s/10\.231\./$SVT_NET./g" -e "s/fd00:231:/$SVT_NET6:/g" "$f" >"$SVT_CCD/${f##*/}"
 done
 chmod 755 "$SVT_CCD" && chmod 644 "$SVT_CCD"/*
+# The browser test writes its screenshots here, as the invoking user.
+export SVT_UID=$(id -u) SVT_GID=$(id -g)
+mkdir -p artifacts
 
 dc() { docker compose "$@"; }
 pass=0 fail=0 warn=0
@@ -443,6 +446,141 @@ rekeys=$(dc logs tlscrypt-server 2>/dev/null | grep -c 'data channel rekeyed')
 out=$(x tlscrypt-client curl -s -m 5 http://$WEB/ 2>&1)
 [ "$rekeys" -ge 2 ] && echo "$out" | grep -q "you are $SVT_NET.10.112" &&
   ok "tls-crypt: traffic still flows after $rekeys renegotiations over TCP (tlscrypt-client, reneg-sec 15)" || bad "tls-crypt renegotiation" "rekeys=$rekeys web: $out"
+
+echo "==> web UI (webui-server: configuration in a writable volume, managed over its API)"
+WUI=https://webui-server:8443
+wlog() { dc logs --no-log-prefix webui-server 2>/dev/null; }
+# api METHOD PATH [CURL ARGS...]: prints the body, then the HTTP status on a line of its own
+CSRF=
+api() {
+  local m=$1 p=$2; shift 2
+  x webui-client curl -sk -m 30 -b /tmp/jar -c /tmp/jar -X "$m" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
+    -w '\n%{http_code}' "$@" "$WUI/api$p"
+}
+code() { tail -n1 <<<"$1"; }
+body() { sed '$d' <<<"$1"; }
+jqw() { x webui-client jq -r "$@"; } # jq in the client container (stdin)
+ovpn_log() { x webui-client cat /tmp/ovpn.log 2>/dev/null; }
+# vpn_up PROFILE [ARGS...]: start openvpn in webui-client and wait for the tunnel
+vpn_up() {
+  x webui-client sh -c 'test -f /tmp/ovpn.pid && kill $(cat /tmp/ovpn.pid) 2>/dev/null; sleep 1; rm -f /tmp/ovpn.log /tmp/ovpn.pid'
+  x webui-client openvpn --config "$1" --daemon --log /tmp/ovpn.log --writepid /tmp/ovpn.pid "${@:2}" >/dev/null 2>&1
+  for _ in $(seq 1 30); do ovpn_log | grep -q 'Initialization Sequence Completed' && return 0; sleep 1; done
+  return 1
+}
+for _ in $(seq 1 20); do x webui-client curl -sk -m 2 -o /dev/null $WUI/ && break; sleep 1; done
+
+id=$(dc ps -q webui-server)
+got=$(docker inspect -f '{{.Config.User}} {{json .HostConfig.CapDrop}} {{json .HostConfig.CapAdd}} {{.HostConfig.ReadonlyRootfs}} {{len .HostConfig.Devices}} {{.HostConfig.Privileged}}' "$id" 2>/dev/null)
+[ "$got" = '65534:65534 ["ALL"] null true 0 false' ] && ok "webui-server is locked down like server (uid 65534, no capabilities, read-only root, no devices)" || bad "webui-server locked down" "$got"
+PW=$(wlog | sed -n 's/.*created an administrator account.* password=\([^ ]*\) .*/\1/p' | head -1)
+[ -n "$PW" ] && [ "$(wlog | grep -c 'password=')" = 1 ] &&
+  ok "first start created the admin account and logged its random password once" || bad "admin bootstrap password in the log" "$(wlog | grep -i 'web ui' | head -3)"
+r=$(api POST /login -H 'X-Requested-With: softvpn' -d '{"username":"admin","password":"not-it"}')
+[ "$(code "$r")" = 401 ] && ok "web UI refuses a wrong admin password (HTTP 401)" || bad "bad login refused" "$r"
+r=$(api POST /login -H 'X-Requested-With: softvpn' -d "{\"username\":\"admin\",\"password\":\"$PW\"}")
+CSRF=$(body "$r" | jqw .csrf)
+[ "$(code "$r")" = 200 ] && [ -n "$CSRF" ] && [ "$CSRF" != null ] && ok "admin logs in over HTTPS and gets a session and CSRF token" || bad "admin login" "$r"
+r=$(x webui-client curl -sk -m 10 -b /tmp/jar -o /dev/null -w '%{http_code}' -X PUT -H 'X-CSRF-Token: wrong' -d '{"text":"verb 4\n"}' $WUI/api/config)
+[ "$r" = 403 ] && ok "a change without the session's CSRF token is refused (HTTP 403)" || bad "CSRF check" "$r"
+r=$(api GET /status)
+st=$(body "$r" | jqw '"\(.running) \(.listeners|length) \(.subnet) \(.config.writable)"')
+started0=$(body "$r" | jqw .engineStarted)
+[ "$st" = "true 2 10.11.0.0/24 true" ] && ok "status: running, UDP and TCP listeners, 10.11.0.0/24, configuration writable" || bad "status API" "$st"
+
+r=$(api POST /clients -d '{"name":"webclient"}')
+[ "$(code "$r")" = 201 ] && ok "created client webclient through the API (certificate issued)" || bad "create a client via the API" "$r"
+x webui-client sh -c "curl -sk -m 15 -b /tmp/jar -o /tmp/webclient.ovpn -w '%{http_code}' $WUI/api/clients/webclient/profile" >/tmp/svt$SVT_ID.code 2>&1
+prof=$(x webui-client cat /tmp/webclient.ovpn 2>/dev/null)
+if [ "$(cat /tmp/svt$SVT_ID.code)" = 200 ] && grep -q '^remote webui-server 1194$' <<<"$prof" && grep -q '^<cert>' <<<"$prof" && ! grep -q auth-user-pass <<<"$prof"; then
+  ok "downloaded its profile: remote webui-server 1194 (from the request's host), certificate inlined"
+else
+  bad "download the client's profile" "$(cat /tmp/svt$SVT_ID.code) $(head -6 <<<"$prof")"
+fi
+rm -f /tmp/svt$SVT_ID.code
+if vpn_up /tmp/webclient.ovpn; then
+  ok "stock OpenVPN 2.6 connected with exactly the downloaded profile"
+else
+  bad "connect with the downloaded profile" "$(ovpn_log | tail -3)"
+fi
+out=$(x webui-client curl -s -m 5 http://$WEB/ 2>&1)
+echo "$out" | grep -q "you are $SVT_NET.10.120" && ok "webclient -> web through webui-server's NAT" || bad "traffic with the downloaded profile" "$out"
+r=$(api GET /sessions)
+n=$(body "$r" | jqw '[.sessions[] | select(.commonName == "webclient")] | length')
+[ "$n" = 1 ] && ok "sessions API lists webclient as connected ($(body "$r" | jqw '.sessions[0] | "\(.ip), OpenVPN \(.version), \(.cipher)"'))" || bad "sessions API" "$r"
+
+# Change the configuration: a new pushed option and keepalive.
+r=$(api GET /config)
+hash=$(body "$r" | jqw .hash)
+new=$(body "$r" | jqw '.text | sub("keepalive 10 60"; "keepalive 8 40") + "push \"dhcp-option DOMAIN webui.test\"\n"')
+req=$(x webui-client jq -n --arg t "$new" --arg h "$hash" '{text: $t, hash: $h}')
+r=$(api PUT /config -d "$req")
+[ "$(code "$r")" = 200 ] && [ "$(body "$r" | jqw .ok)" = true ] && ok "saved and applied a changed configuration through the API" || bad "apply a configuration change" "$r"
+r=$(api GET /status)
+started1=$(body "$r" | jqw .engineStarted)
+[ "$started1" != "$started0" ] && [ "$(body "$r" | jqw .running)" = true ] && wlog | grep -q 'new configuration applied' &&
+  ok "the VPN engine restarted in-process; the web UI and its session survived" || bad "engine restart" "$started0 -> $started1"
+r=$(api GET /config)
+body "$r" | jqw .text | grep -q '^keepalive 8 40$' && ok "the file in the volume has the new content" || bad "config file written" "$(body "$r" | head -c 300)"
+for _ in $(seq 1 40); do [ "$(ovpn_log | grep -c 'Initialization Sequence Completed')" -ge 2 ] && break; sleep 1; done
+push=$(ovpn_log | grep 'PUSH: Received control message' | tail -1)
+if ovpn_log | grep -q 'Connection reset command was pushed by server\|SIGUSR1' && grep -q 'dhcp-option DOMAIN webui.test' <<<"$push" && grep -q 'ping 8,ping-restart 40' <<<"$push"; then
+  ok "webclient was told to reconnect and got the new options (dhcp-option DOMAIN webui.test, ping 8, ping-restart 40)"
+else
+  bad "client reconnected with the new options" "$(ovpn_log | grep -i 'restart\|PUSH' | tail -3)"
+fi
+out=$(x webui-client curl -s -m 5 http://$WEB/ 2>&1)
+echo "$out" | grep -q "you are $SVT_NET.10.120" && ok "traffic flows again after the restart" || bad "traffic after the restart" "$out"
+
+# The UI itself, in headless Chromium: every page, desktop and phone, light
+# and dark, while webclient is connected. It changes nothing.
+rm -f artifacts/*.png
+if out=$(dc --profile ui build -q uitest 2>&1 && dc --profile ui run --rm --no-deps -e PASSWORD="$PW" uitest 2>&1); then
+  ok "UI smoke test in headless Chromium: $(echo "$out" | tail -1)"
+else
+  bad "UI smoke test in headless Chromium" "$(echo "$out" | grep -v '^screenshot' | tail -5)"
+fi
+
+# An invalid configuration is refused with a line number, and nothing changes.
+r=$(api GET /config)
+hash=$(body "$r" | jqw .hash)
+req=$(x webui-client jq -n --arg t "$(body "$r" | jqw .text)no-such-directive 1" --arg h "$hash" '{text: $t, hash: $h}')
+r=$(api PUT /config -d "$req")
+line=$(body "$r" | jqw '.errors[0] | "\(.line): \(.message)"')
+r2=$(api GET /config)
+if [ "$(code "$r")" = 422 ] && [ "$(body "$r2" | jqw .hash)" = "$hash" ] && [ "$(api GET /status | sed '$d' | jqw .engineStarted)" = "$started1" ]; then
+  ok "an invalid configuration is rejected (line $line), the file and the running server are unchanged"
+else
+  bad "invalid configuration rejected" "$r"
+fi
+
+# Revoke webclient through the API: crl-verify disconnects it.
+r=$(api POST /clients/webclient/revoke -d '{}')
+[ "$(code "$r")" = 200 ] && [ "$(body "$r" | jqw .crlVerify)" = true ] && ok "revoked webclient through the API (the server checks that CRL)" || bad "revoke via the API" "$r"
+for _ in $(seq 1 15); do wlog | grep -q 'disconnecting client: certificate revoked.*client=webclient ' && break; sleep 1; done
+for _ in $(seq 1 10); do ovpn_log | grep -q 'AUTH_FAILED' && break; sleep 1; done
+wlog | grep -q 'disconnecting client: certificate revoked.*client=webclient ' && ovpn_log | grep -q AUTH_FAILED &&
+  ok "webclient was disconnected within seconds and told why (AUTH_FAILED)" || bad "revoked client disconnected" "$(ovpn_log | tail -2)"
+
+# A password user: added through the API, connects with the password-only profile.
+r=$(api POST /users -d '{"name":"webuser","password":"s3cret-Pass"}')
+[ "$(code "$r")" = 201 ] && ok "added password user webuser through the API" || bad "add a password user" "$r"
+x webui-client sh -c "curl -sfk -m 15 -b /tmp/jar -o /tmp/webuser.ovpn $WUI/api/users/webuser/profile && printf 'webuser\ns3cret-Pass\n' > /tmp/webuser.pass"
+if x webui-client grep -q '^auth-user-pass$' /tmp/webuser.ovpn && ! x webui-client grep -q '<cert>' /tmp/webuser.ovpn && vpn_up /tmp/webuser.ovpn --auth-user-pass /tmp/webuser.pass; then
+  ok "webuser connected with the downloaded password-only profile"
+else
+  bad "connect as the new password user" "$(ovpn_log | tail -3)"
+fi
+out=$(x webui-client curl -s -m 5 http://$WEB/ 2>&1)
+echo "$out" | grep -q "you are $SVT_NET.10.120" && wlog | grep -q 'user authenticated.*user=webuser' &&
+  ok "webuser -> web through NAT; the server checked the new password without a restart" || bad "password user traffic" "$out"
+
+r=$(api GET /sessions)
+sid=$(body "$r" | jqw '.sessions[] | select(.username == "webuser") | .id')
+r=$(api POST /sessions/$sid/disconnect -d '{}')
+for _ in $(seq 1 10); do ovpn_log | grep -q 'Connection reset command was pushed by server.*disconnected by the administrator\|process exiting' && break; sleep 1; done
+[ "$(code "$r")" = 200 ] && ovpn_log | grep -q 'process exiting' &&
+  ok "disconnect from the dashboard: webuser was told to exit (HALT) and did" || bad "disconnect a session via the API" "$r / $(ovpn_log | tail -2)"
 
 echo "==> server log"
 dc logs --no-log-prefix server 2>/dev/null | grep -E 'connected|listening|authenticated|rejected|revoked|removed' | sed 's/^/    server: /'

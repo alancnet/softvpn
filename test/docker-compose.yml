@@ -71,6 +71,7 @@ networks:
 
 volumes:
   pki:
+  webcfg: # webui-server's /etc/softvpn: server.conf, its PKI, ccd, users; read-write
 
 services:
   # Creates the CA, certificates and client .ovpn profiles (idempotent).
@@ -406,6 +407,60 @@ services:
     command: [client-entrypoint.sh, --config, /pki/tapclient2.ovpn, --dev, tap, --proto, tcp-client]
     environment: { SERVE_PORT: "8080" }
     networks: [tapedge]
+
+  # ---- web UI ----
+  # The configuration volume starts with server-webui.conf, an empty
+  # client-config-dir and users file, all owned by the server's uid. Only
+  # this one-shot setup step runs as root (to chown the new volume).
+  webui-init:
+    image: softvpn-test-tools${SVT_ID:-}
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    network_mode: none
+    volumes: [webcfg:/cfg, ./server-webui.conf:/src/server.conf:ro]
+    command: [sh, -c, "test -f /cfg/server.conf || { cp /src/server.conf /cfg/server.conf && mkdir -p /cfg/ccd /cfg/pki && touch /cfg/users && chmod 600 /cfg/users; } && chown -R 65534:65534 /cfg"]
+  webui-pki:
+    <<: *pki
+    build: !reset null
+    depends_on: { webui-init: { condition: service_completed_successfully } }
+    volumes: [webcfg:/etc/softvpn]
+    command: [pki, init, -dir, /etc/softvpn/pki]
+
+  # softvpn with the web UI on :8443 (self-signed TLS). Locked down like
+  # server, but its configuration volume is writable so the UI can save.
+  webui-server:
+    <<: *locked-down
+    image: softvpn:test${SVT_ID:-}
+    user: "65534:65534"
+    depends_on: { webui-pki: { condition: service_completed_successfully } }
+    command: [server, --config, /etc/softvpn/server.conf]
+    volumes: [webcfg:/etc/softvpn]
+    tmpfs: ["/tmp:uid=65534,gid=65534"]
+    networks:
+      wan: { ipv4_address: "${SVT_NET:-10.231}.10.120" }
+      edge: { ipv4_address: "${SVT_NET:-10.231}.20.120" }
+
+  # Drives the web UI's API with curl and connects with the profiles it
+  # downloads (run.sh starts openvpn in it).
+  webui-client:
+    <<: *client
+    depends_on: [webui-server]
+    volumes: []
+    command: [sleep, infinity]
+
+  # The UI in headless Chromium (test/ui/smoke.py); run by run.sh.
+  uitest:
+    build: ./ui
+    image: softvpn-test-ui${SVT_ID:-}
+    profiles: [ui]
+    user: "${SVT_UID:-1000}:${SVT_GID:-1000}"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment: { BASE_URL: "https://webui-server:8443", OUT: /out }
+    volumes: [./ui/smoke.py:/ui/smoke.py:ro, ./artifacts:/out]
+    networks: [edge]
 
   # Gets no pushed ifconfig ("route-gateway dhcp"); run.sh runs udhcpc,
   # which also needs NET_RAW for its raw socket.
