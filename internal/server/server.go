@@ -37,6 +37,7 @@ type Server struct {
 	byIP     map[netip.Addr]*ovpn.Session
 	byCN     map[string]*ovpn.Session
 	sessions map[*ovpn.Session]netip.Addr
+	tokens   map[*ovpn.Session]string // auth-token to push at Connect
 }
 
 func New(cfg *Config, log *slog.Logger) (*Server, error) {
@@ -63,6 +64,7 @@ func New(cfg *Config, log *slog.Logger) (*Server, error) {
 		byIP:     map[netip.Addr]*ovpn.Session{},
 		byCN:     map[string]*ovpn.Session{},
 		sessions: map[*ovpn.Session]netip.Addr{},
+		tokens:   map[*ovpn.Session]string{},
 	}, nil
 }
 
@@ -83,8 +85,13 @@ func (s *Server) Run(ctx context.Context) error {
 	s.stack = st
 	s.pinger = newPinger(s.log, s.deliver)
 
+	tlsConf := s.cfg.TLS
+	if s.cfg.Auth.CRL != nil {
+		tlsConf = tlsConf.Clone()
+		tlsConf.VerifyConnection = s.verifyConnection
+	}
 	engine := ovpn.NewServer(ovpn.Options{
-		TLS:             s.cfg.TLS,
+		TLS:             tlsConf,
 		Ciphers:         s.cfg.Ciphers,
 		PingInterval:    s.cfg.PingInterval,
 		PingTimeout:     2 * s.cfg.PingTimeout, // OpenVPN doubles the server side
@@ -122,6 +129,11 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.cfg.StatusFile != "" {
 		go s.statusLoop(ctx)
 	}
+	if s.cfg.Auth.CRL != nil || s.cfg.Auth.Users != nil {
+		s.log.Info("client authentication", "verify_client_cert", s.cfg.Auth.VerifyClientCert,
+			"users", s.cfg.Auth.Users != nil, "crl", s.cfg.Auth.CRL != nil, "auth_gen_token", s.cfg.Auth.AuthGenToken)
+		go s.authWatch(ctx)
+	}
 
 	select {
 	case <-ctx.Done():
@@ -139,6 +151,7 @@ func (s *Server) Run(ctx context.Context) error {
 // address.
 func (s *Server) Connect(ss *ovpn.Session) (*ovpn.Assignment, error) {
 	cn := ss.CommonName()
+	token := s.takeToken(ss)
 	cc, err := s.cfg.loadCCD(cn)
 	if err != nil {
 		s.log.Error("client-config-dir", "client", cn, "err", err)
@@ -178,6 +191,9 @@ func (s *Server) Connect(ss *ovpn.Session) (*ovpn.Assignment, error) {
 		push = append(push, s.cfg.Push...)
 	}
 	push = append(push, cc.Push...)
+	if token != "" {
+		push = append(push, "auth-token "+token)
+	}
 	return &ovpn.Assignment{
 		IP:      ip,
 		Netmask: net.IP(net.CIDRMask(s.cfg.Subnet.Bits(), 32)).String(),
