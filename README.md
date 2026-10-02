@@ -31,7 +31,6 @@ Images for amd64 and arm64 are published to Docker Hub as
 yourself, run `docker build -t alancnet/softvpn .`.
 
 ```sh
-
 # CA, server certificate, and a ready-to-use client profile
 docker volume create softvpn-pki
 docker run --rm -v softvpn-pki:/pki alancnet/softvpn \
