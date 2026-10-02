@@ -24,19 +24,24 @@ through unprivileged ICMP sockets, which Docker allows by default.
 
 ## Quick start
 
+Images for amd64 and arm64 are published to Docker Hub as
+[`alancnet/softvpn`](https://hub.docker.com/r/alancnet/softvpn). Every push to
+`main` and every `v*` tag publishes, once the tests pass (see
+[.github/workflows/docker.yml](.github/workflows/docker.yml)). To build it
+yourself, run `docker build -t alancnet/softvpn .`.
+
 ```sh
-docker build -t softvpn .
 
 # CA, server certificate, and a ready-to-use client profile
 docker volume create softvpn-pki
-docker run --rm -v softvpn-pki:/pki softvpn \
+docker run --rm -v softvpn-pki:/pki alancnet/softvpn \
   pki init -dir /pki -clients laptop -remote vpn.example.com
 
 # Run it: no capabilities, no devices, not root
 docker run -d --name softvpn --read-only --cap-drop ALL \
   --security-opt no-new-privileges -p 1194:1194/udp \
   -v softvpn-pki:/pki:ro -v $PWD/server.conf:/etc/softvpn/server.conf:ro \
-  softvpn
+  alancnet/softvpn
 
 # Hand /pki/laptop.ovpn to the client and run: openvpn --config laptop.ovpn
 ```
