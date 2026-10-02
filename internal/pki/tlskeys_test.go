@@ -49,8 +49,7 @@ func TestWrapProfiles(t *testing.T) {
 		{WrapTLSCrypt, []string{"<tls-crypt>\n#\n# 2048 bit OpenVPN static key", "</tls-crypt>\n"}},
 		{WrapTLSCryptV2, []string{"<tls-crypt-v2>\n-----BEGIN OpenVPN tls-crypt-v2 client key-----\n"}},
 	} {
-		d.Wrap = c.w
-		p, err := d.Profile("laptop", "vpn.example.com", 1194, "udp")
+		p, err := d.Profile("laptop", "vpn.example.com", 1194, "udp", ProfileOptions{Wrap: c.w})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -89,8 +88,7 @@ func TestWrapProfiles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	d.Wrap = "bogus"
-	if _, err := d.Profile("laptop", "x", 1, "udp"); err == nil {
+	if _, err := d.Profile("laptop", "x", 1, "udp", ProfileOptions{Wrap: "bogus"}); err == nil {
 		t.Fatal("bogus wrap accepted")
 	}
 	if _, err := ParseWrap("TLS-Crypt"); err != nil {

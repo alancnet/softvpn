@@ -122,10 +122,10 @@ func (d Dir) GenTLSCryptV2ClientKey(name string, metadata []byte) (bool, error) 
 	return true, d.write(file, k, d.privateMode())
 }
 
-// wrapBlock is the profile section for the directory's Wrap mode.
-func (d Dir) wrapBlock(name string) (string, error) {
+// wrapBlock is the profile section for wrap mode w.
+func (d Dir) wrapBlock(name string, w Wrap) (string, error) {
 	var file, tag, extra string
-	switch d.Wrap {
+	switch w {
 	case WrapNone:
 		return "", nil
 	case WrapTLSAuth:
@@ -135,7 +135,7 @@ func (d Dir) wrapBlock(name string) (string, error) {
 	case WrapTLSCryptV2:
 		file, tag = TLSCryptV2ClientKeyFile(name), "tls-crypt-v2"
 	default:
-		return "", fmt.Errorf("unknown control-channel wrap %q", d.Wrap)
+		return "", fmt.Errorf("unknown control-channel wrap %q", w)
 	}
 	k, err := d.Read(file)
 	if err != nil {

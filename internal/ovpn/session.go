@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"strings"
 	"sync"
@@ -21,6 +23,11 @@ type Assignment struct {
 	Netmask string // dotted quad, for "ifconfig"
 	Gateway netip.Addr
 	Push    []string
+	// TAP: the client is bridged (dev tap), so no "topology" is pushed.
+	// DHCP: the client gets its address by DHCP over the bridge instead of
+	// a pushed "ifconfig", and learns the gateway the same way. An invalid
+	// Gateway pushes no route-gateway at all.
+	TAP, DHCP bool
 }
 
 // Handler connects sessions to the application (the virtual router).
@@ -32,6 +39,24 @@ type Handler interface {
 	Packet(s *Session, pkt []byte)
 	// Disconnect is called once for every session Connect accepted.
 	Disconnect(s *Session, reason string)
+}
+
+// Credentials are what a client presented in one key exchange.
+type Credentials struct {
+	Certificate   *x509.Certificate // nil if the client sent none
+	Username      string            // from auth-user-pass; empty if not sent
+	Password      string
+	Renegotiation bool // false for the session's first key exchange
+}
+
+// Authenticator is an optional Handler extension that checks credentials.
+// Authenticate is called for every key exchange, the first (before Connect)
+// and each renegotiation, and returns the common name the session is known
+// by. An error is sent to the client as AUTH_FAILED and ends the session.
+// Handlers without it accept any client whose certificate passed TLS
+// verification, under the certificate's CN.
+type Authenticator interface {
+	Authenticate(s *Session, c *Credentials) (commonName string, err error)
 }
 
 // transport sends wire packets to one client.
@@ -58,6 +83,8 @@ type Session struct {
 	mu     sync.Mutex
 	keys   [8]*keyState
 	cn     string
+	user   string
+	cert   *x509.Certificate
 	pi     peerInfo
 	cipher string
 	useEKM bool
@@ -80,6 +107,7 @@ type keyState struct {
 	id   byte
 	rel  *reliable
 	pipe *pipe
+	conn atomic.Pointer[tls.Conn] // once the handshake is done
 	data atomic.Pointer[dataKeys]
 }
 
@@ -101,8 +129,21 @@ func newSession(srv *Server, tr transport, remoteSID sessionID, peerID uint32, w
 	return s
 }
 
-// CommonName is the client certificate's CN.
+// CommonName is the client certificate's CN, or what the Authenticator
+// chose (the username, with username-as-common-name).
 func (s *Session) CommonName() string { return s.cn }
+
+// Username is the auth-user-pass username the session authenticated with,
+// or "" for certificate-only clients.
+func (s *Session) Username() string { return s.user }
+
+// Certificate is the client certificate from the latest key exchange, or
+// nil if the client did not send one.
+func (s *Session) Certificate() *x509.Certificate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cert
+}
 
 // PeerInfo returns an IV_* value the client sent (e.g. "IV_VER").
 func (s *Session) PeerInfo(key string) string { return s.pi[key] }
@@ -129,6 +170,18 @@ func (s *Session) Close(reason string) {
 			s.log.Info("handshake abandoned", "reason", reason)
 		}
 	})
+}
+
+// Kick tells the client why it is being disconnected, then ends the
+// session. msg is an OpenVPN control message: "AUTH_FAILED,reason" makes a
+// stock client stop; "RESTART" makes it reconnect.
+func (s *Session) Kick(msg, reason string) {
+	if ks := s.primary.Load(); ks != nil {
+		if conn := ks.conn.Load(); conn != nil {
+			conn.Write([]byte(msg + "\x00"))
+		}
+	}
+	time.AfterFunc(2*time.Second, func() { s.Close(reason) })
 }
 
 // newKeyState must be called with s.mu held (or before the session is shared).
@@ -298,11 +351,20 @@ func (s *Session) runKey(ks *keyState) {
 		}
 	}
 	if err := conn.HandshakeContext(ctx); err != nil {
+		if ks.id != 0 && ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+			// e.g. the certificate has been revoked since the session began
+			s.Close(fmt.Sprintf("renegotiation TLS handshake failed: %v", err))
+			return
+		}
 		fail("TLS handshake failed", err)
 		return
 	}
+	ks.conn.Store(conn)
 	cs := conn.ConnectionState()
-	cn := cs.PeerCertificates[0].Subject.CommonName
+	var cert *x509.Certificate
+	if len(cs.PeerCertificates) > 0 {
+		cert = cs.PeerCertificates[0]
+	}
 
 	// Key method 2: OpenVPN writes it in one TLS record, so it normally
 	// arrives in a single read.
@@ -325,21 +387,15 @@ func (s *Session) runKey(ks *keyState) {
 	}
 
 	s.mu.Lock()
-	first := ks.id == 0 && s.cn == ""
+	first := ks.id == 0
 	if first {
-		s.cn = cn
 		s.pi = parsePeerInfo(km.peerInfo)
-		s.log = s.log.With("client", cn)
 		s.useEKM = s.pi.protoFlags()&ivProtoTLSKeyExport != 0
 		s.useV2.Store(s.pi.protoFlags()&ivProtoDataV2 != 0)
 		s.cipher, _ = negotiateCipher(s.srv.opt.Ciphers, s.pi)
 	}
-	sameCN, cipherName, useEKM := s.cn == cn, s.cipher, s.useEKM
+	cipherName, useEKM := s.cipher, s.useEKM
 	s.mu.Unlock()
-	if !sameCN {
-		s.Close("client certificate changed during renegotiation")
-		return
-	}
 
 	sRand1, sRand2 := randomBytes(32), randomBytes(32)
 	var block []byte
@@ -358,11 +414,31 @@ func (s *Session) runKey(ks *keyState) {
 		return
 	}
 
+	if first && cipherName == "" {
+		s.authFailed(conn, "no common data-channel cipher (server offers "+strings.Join(s.srv.opt.Ciphers, ":")+")")
+		return
+	}
+	cn, err := s.authenticate(&Credentials{Certificate: cert, Username: km.username, Password: km.password, Renegotiation: !first})
+	if err != nil {
+		s.authFailed(conn, err.Error())
+		return
+	}
+	s.mu.Lock()
+	sameCN := first || s.cn == cn
 	if first {
-		if cipherName == "" {
-			s.authFailed(conn, "no common data-channel cipher (server offers "+strings.Join(s.srv.opt.Ciphers, ":")+")")
-			return
-		}
+		s.cn, s.user = cn, km.username
+		s.log = s.log.With("client", cn)
+	}
+	if sameCN {
+		s.cert = cert
+	}
+	s.mu.Unlock()
+	if !sameCN {
+		s.Close("client identity changed during renegotiation")
+		return
+	}
+
+	if first {
 		a, err := s.srv.h.Connect(s)
 		if err != nil {
 			s.authFailed(conn, err.Error())
@@ -393,6 +469,17 @@ func (s *Session) runKey(ks *keyState) {
 	}
 
 	s.readControlMessages(conn)
+}
+
+// authenticate checks a key exchange's credentials with the handler.
+func (s *Session) authenticate(c *Credentials) (string, error) {
+	if a, ok := s.srv.h.(Authenticator); ok {
+		return a.Authenticate(s, c)
+	}
+	if c.Certificate == nil {
+		return "", errors.New("client certificate required")
+	}
+	return c.Certificate.Subject.CommonName, nil
 }
 
 // retire drops a superseded key after OpenVPN's default transition window,
@@ -471,13 +558,23 @@ func (s *Session) controlMessage(conn *tls.Conn, msg string) {
 func (s *Session) pushReply(a *Assignment) []string {
 	opt := s.srv.opt
 	opts := append([]string(nil), a.Push...)
+	switch {
+	case !a.Gateway.IsValid():
+	case a.DHCP:
+		opts = append(opts, "route-gateway dhcp")
+	default:
+		opts = append(opts, "route-gateway "+a.Gateway.String())
+	}
+	if !a.TAP {
+		opts = append(opts, "topology subnet")
+	}
 	opts = append(opts,
-		"route-gateway "+a.Gateway.String(),
-		"topology subnet",
 		fmt.Sprintf("ping %d", int(opt.PushPing/time.Second)),
 		fmt.Sprintf("ping-restart %d", int(opt.PushPingRestart/time.Second)),
-		"ifconfig "+a.IP.String()+" "+a.Netmask,
 	)
+	if !a.DHCP {
+		opts = append(opts, "ifconfig "+a.IP.String()+" "+a.Netmask)
+	}
 	if s.useV2.Load() {
 		opts = append(opts, fmt.Sprintf("peer-id %d", s.peerID))
 	}
