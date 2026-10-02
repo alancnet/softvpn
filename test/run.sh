@@ -9,7 +9,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 export SVT_ID=${SVT_ID:-} SVT_NET=${SVT_NET:-10.231}
-WEB=$SVT_NET.10.10 SRV_WAN=$SVT_NET.10.100
+WEB=$SVT_NET.10.10 SRV_WAN=$SVT_NET.10.100 TAP_WAN=$SVT_NET.10.101 DHCP_WAN=$SVT_NET.10.102
 
 dc() { docker compose "$@"; }
 pass=0 fail=0 warn=0
@@ -37,8 +37,8 @@ if ! out=$(dc up -d --build --quiet-pull 2>&1); then
   exit 1
 fi
 
-echo "==> waiting for both clients to finish connecting"
-for c in client1 client2 client3; do
+echo "==> waiting for the clients to finish connecting"
+for c in client1 client2 client3 tapclient1 tapclient2 tapclient3; do
   for _ in $(seq 1 30); do
     dc logs "$c" 2>/dev/null | grep -q "Initialization Sequence Completed" && break
     sleep 1
@@ -137,12 +137,80 @@ else
   bad "client1 renegotiated keys" "server saw $n rekeys"
 fi
 
+echo "==> TAP mode (dev tap, virtual Ethernet switch)"
+ids=$(for svc in tapserver dhcpserver; do dc ps -q "$svc"; done)
+if [ "$(echo "$ids" | wc -w)" = 2 ]; then
+  for id in $ids; do
+    pid=$(docker inspect -f '{{.State.Pid}}' "$id")
+    echo "$(docker inspect -f '{{.Config.User}} {{json .HostConfig.CapDrop}} {{.HostConfig.ReadonlyRootfs}} {{len .HostConfig.Devices}}' "$id") $(awk '/^CapEff/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+  done | sort -u | grep -qx '65534:65534 \["ALL"\] true 0 0000000000000000' &&
+    ok "TAP servers run as uid 65534, no capabilities, read-only, no devices" || bad "TAP servers locked down"
+else
+  bad "TAP servers are running"
+fi
+tapip() { x "$1" ip -4 -o addr show tap0 2>/dev/null | awk '{print $4}' | head -1; }
+t1=$(tapip tapclient1) t2=$(tapip tapclient2)
+case "$t1" in 10.9.0.1[0-9][0-9]/24) ok "tapclient1 (UDP) got $t1 on tap0 from the server-bridge pool" ;; *) bad "tapclient1 got a server-bridge pool address" "tap0: $t1" ;; esac
+case "$t2" in 10.9.0.1[0-9][0-9]/24) ok "tapclient2 (OpenVPN 2.5, TCP) got $t2 on tap0" ;; *) bad "tapclient2 got a server-bridge pool address" "tap0: $t2" ;; esac
+t1=${t1%/*} t2=${t2%/*}
+x tapclient1 ip neigh flush dev tap0 >/dev/null 2>&1
+x tapclient1 ping -c 1 -W 2 10.9.0.1 >/dev/null 2>&1
+out=$(x tapclient1 ip neigh show 10.9.0.1 dev tap0 2>&1)
+echo "$out" | grep -q 'lladdr 02:00:0a:09:00:01' && ok "ARP: tapclient1 resolved the gateway 10.9.0.1 to 02:00:0a:09:00:01" || bad "ARP resolution of the gateway" "$out"
+check "tapclient1 pings the gateway 10.9.0.1" x tapclient1 ping -c 3 -W 2 10.9.0.1
+check "redirect-gateway: tapclient1 routes web traffic via tap0" sh -c "docker compose exec -T tapclient1 ip route get $WEB | grep -q 'dev tap0'"
+out=$(x tapclient1 curl -s -m 5 http://$WEB/ 2>&1)
+echo "$out" | grep -q "you are $TAP_WAN" && ok "tapclient1 -> web through the TAP NAT; web saw the server's address" || bad "tapclient1 -> web NATed" "$out"
+out=$(x tapclient2 curl -s -m 5 http://$WEB/ 2>&1)
+echo "$out" | grep -q "you are $TAP_WAN" && ok "tapclient2 -> web over the TCP transport, NATed" || bad "tapclient2 -> web" "$out"
+out=$(x tapclient1 sh -c "echo tap-udp-echo | socat -t 2 - UDP:$WEB:7" 2>&1)
+[ "$out" = tap-udp-echo ] && ok "TAP UDP NAT: echo service answered" || bad "TAP UDP NAT echo" "$out"
+check "TAP ICMP NAT: tapclient1 pings web" x tapclient1 ping -c 3 -W 2 $WEB
+out=$(x tapclient1 dig +short +time=2 +tries=2 @10.9.0.1 web 2>&1)
+[ "$out" = $WEB ] && ok "TAP DNS via 10.9.0.1 (web -> $out)" || bad "TAP DNS via gateway" "$out"
+out=$(x tapclient1 curl -s -m 5 http://$t2:8080/ 2>&1)
+mac2=$(x tapclient2 cat /sys/class/net/tap0/address 2>/dev/null)
+neigh=$(x tapclient1 ip neigh show $t2 dev tap0 2>/dev/null)
+if echo "$out" | grep -q "you are $t1\$" && [ -n "$mac2" ] && echo "$neigh" | grep -q "$mac2"; then
+  ok "client-to-client over the TAP segment: tapclient1 -> $t2 (ARP: $mac2)"
+else
+  bad "client-to-client over TAP" "$out / neigh: $neigh / mac: $mac2"
+fi
+if t=$(x tapclient1 curl -s -m 60 -o /dev/null -w '%{size_download} %{speed_download}' http://$WEB:81/ 2>&1); then
+  read -r size speed <<<"$t"
+  [ "$size" = 50000000 ] && ok "50 MB download through TAP + NAT, intact ($(awk "BEGIN{printf \"%.1f\", $speed*8/1e6}") Mbit/s)" || bad "TAP 50 MB download" "got $size bytes"
+else
+  bad "TAP 50 MB download" "$t"
+fi
+# Anti-spoofing: an address the server did not assign is dropped.
+x tapclient1 ip addr add 10.9.0.250/24 dev tap0 >/dev/null 2>&1
+if x tapclient1 ping -c 2 -W 2 -I 10.9.0.250 10.9.0.1 >/dev/null 2>&1; then
+  bad "TAP anti-spoofing drops a source address the server did not assign"
+else
+  ok "TAP anti-spoofing: traffic from an unassigned address (10.9.0.250) is dropped"
+fi
+x tapclient1 ip addr del 10.9.0.250/24 dev tap0 >/dev/null 2>&1
+
+echo "==> TAP mode with DHCP (server-bridge without arguments)"
+x tapclient3 ip link set tap0 up
+x tapclient3 udhcpc -i tap0 -n -q -t 5 -T 2 -s /usr/local/bin/dhcp-script.sh >/dev/null 2>&1
+lease=$(x tapclient3 cat /tmp/dhcp-lease 2>/dev/null)
+case "$lease" in "ip=10.10.0."*/24*"dns=10.10.0.1"*) ok "tapclient3 got a lease from the built-in DHCP server: $lease" ;; *) bad "DHCP lease" "$lease" ;; esac
+out=$(dc logs tapclient3 2>/dev/null | grep -o 'Extracted DHCP router address: [0-9.]*')
+[ "$out" = "Extracted DHCP router address: 10.10.0.1" ] && ok "route-gateway dhcp: OpenVPN learned the gateway from the DHCP reply" || bad "route-gateway dhcp" "$out"
+x tapclient3 ip route add $WEB via 10.10.0.1 dev tap0 >/dev/null 2>&1
+out=$(x tapclient3 curl -s -m 5 http://$WEB/ 2>&1)
+x tapclient3 ping -c 2 -W 2 10.10.0.1 >/dev/null 2>&1 && echo "$out" | grep -q "you are $DHCP_WAN" &&
+  ok "tapclient3 pings the gateway and reaches web through NAT" || bad "DHCP client -> gateway and web" "$out"
+
 echo "==> server log"
-dc logs --no-log-prefix server 2>/dev/null | grep -E 'connected|listening' | sed 's/^/    /'
+for svc in server tapserver dhcpserver; do
+  dc logs --no-log-prefix $svc 2>/dev/null | grep -E 'connected|listening|switch' | sed "s/^/    $svc: /"
+done
 
 echo
 echo "passed: $pass  failed: $fail  warnings: $warn"
 if [ "$fail" -gt 0 ]; then
-  echo "--- server log"; dc logs --no-log-prefix server | tail -30
+  for svc in server tapserver dhcpserver; do echo "--- $svc log"; dc logs --no-log-prefix $svc | tail -30; done
   exit 1
 fi

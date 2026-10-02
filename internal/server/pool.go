@@ -14,6 +14,8 @@ var errPoolExhausted = errors.New("address pool exhausted")
 type pool struct {
 	subnet  netip.Prefix
 	gateway netip.Addr
+	first   netip.Addr // dynamic range, inclusive
+	last    netip.Addr
 	static  map[string]netip.Addr
 	owner   map[netip.Addr]string // static reservations
 	sticky  map[string]netip.Addr // remembered dynamic address per client
@@ -31,6 +33,8 @@ func newPool(subnet netip.Prefix, gateway netip.Addr, static map[string]netip.Ad
 		held:    map[netip.Addr]string{},
 		inUse:   map[netip.Addr]bool{},
 	}
+	// Usable hosts: gateway+1 .. broadcast-1.
+	p.first, p.last = gateway.Next(), lastAddr(subnet).Prev()
 	for cn, ip := range static {
 		p.owner[ip] = cn
 	}
@@ -57,9 +61,8 @@ func (p *pool) alloc(cn string, want netip.Addr, sticky bool) (netip.Addr, error
 			return ip, nil
 		}
 	}
-	// Usable hosts: gateway+1 .. broadcast-1.
-	for ip := p.gateway.Next(); p.subnet.Contains(ip.Next()); ip = ip.Next() {
-		if p.inUse[ip] || p.owner[ip] != "" || p.held[ip] != "" {
+	for ip := p.first; !p.last.Less(ip); ip = ip.Next() {
+		if ip == p.gateway || p.inUse[ip] || p.owner[ip] != "" || p.held[ip] != "" {
 			continue
 		}
 		p.take(cn, ip, sticky)
@@ -67,8 +70,8 @@ func (p *pool) alloc(cn string, want netip.Addr, sticky bool) (netip.Addr, error
 	}
 	// Every address is either in use or remembered for an offline client;
 	// reclaim the first remembered one.
-	for ip := p.gateway.Next(); p.subnet.Contains(ip.Next()); ip = ip.Next() {
-		if p.inUse[ip] || p.owner[ip] != "" {
+	for ip := p.first; !p.last.Less(ip); ip = ip.Next() {
+		if ip == p.gateway || p.inUse[ip] || p.owner[ip] != "" {
 			continue
 		}
 		delete(p.sticky, p.held[ip])

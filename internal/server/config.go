@@ -20,6 +20,7 @@ var directives = []string{
 	"port", "proto", "local", "dev", "server", "topology", "ca", "cert", "key",
 	"client-to-client", "duplicate-cn", "keepalive", "push", "client-config-dir",
 	"max-clients", "data-ciphers", "ncp-ciphers", "tun-mtu", "status", "verb",
+	"server-bridge", "dev-type", "lladdr",
 	// softvpn extensions
 	"upstream-dns", "nat-allow", "nat-deny",
 }
@@ -31,7 +32,7 @@ var ignored = []string{
 	"explicit-exit-notify", "ifconfig-pool-persist", "tls-server", "mode",
 	"data-ciphers-fallback", "tls-version-min", "remote-cert-tls", "mute",
 	"log", "log-append", "daemon", "script-security", "sndbuf", "rcvbuf",
-	"txqueuelen", "fast-io", "mssfix", "tun-mtu-extra", "dev-type",
+	"txqueuelen", "fast-io", "mssfix", "tun-mtu-extra",
 }
 
 // Listener is one transport the server accepts clients on.
@@ -61,6 +62,15 @@ type Config struct {
 	StatusFile     string
 	StatusInterval time.Duration
 	Verb           int
+
+	// TAP (bridged) mode: clients exchange Ethernet frames over a virtual
+	// switch; see bridge.go.
+	TAP       bool
+	PoolStart netip.Addr // server-bridge address range (else the whole subnet)
+	PoolEnd   netip.Addr
+	DHCP      bool // server-bridge without arguments: addresses only by DHCP
+	NoGateway bool // server-bridge nogw: no route-gateway, no DHCP router
+	MAC       net.HardwareAddr
 }
 
 // Load validates directives and builds a server Config.
@@ -100,10 +110,29 @@ func Load(c *config.Config) (*Config, error) {
 		cfg.Listeners = append(cfg.Listeners, Listener{Proto: p, Addr: net.JoinHostPort(local, port)})
 	}
 
-	if d, ok := c.Last("dev"); ok && !strings.HasPrefix(d.Arg(0), "tun") {
-		return nil, d.Errorf("only routed (tun) mode is supported")
+	// The device type comes from dev-type, or else the dev name (tun0, tap).
+	if d, ok := c.Last("dev"); ok {
+		switch {
+		case strings.HasPrefix(d.Arg(0), "tun"):
+		case strings.HasPrefix(d.Arg(0), "tap"):
+			cfg.TAP = true
+		default:
+			if !c.Has("dev-type") {
+				return nil, d.Errorf("cannot tell the device type of %q (use tun or tap, or set dev-type)", d.Arg(0))
+			}
+		}
 	}
-	if d, ok := c.Last("topology"); ok && d.Arg(0) != "subnet" {
+	if d, ok := c.Last("dev-type"); ok {
+		switch d.Arg(0) {
+		case "tun":
+			cfg.TAP = false
+		case "tap":
+			cfg.TAP = true
+		default:
+			return nil, d.Errorf("dev-type must be tun or tap")
+		}
+	}
+	if d, ok := c.Last("topology"); ok && d.Arg(0) != "subnet" && !cfg.TAP {
 		return nil, d.Errorf("only \"topology subnet\" is supported")
 	}
 
@@ -130,6 +159,9 @@ func Load(c *config.Config) (*Config, error) {
 	}
 	cfg.Subnet = p.Masked()
 	cfg.Gateway = cfg.Subnet.Addr().Next()
+	if err := cfg.loadBridge(c); err != nil {
+		return nil, err
+	}
 
 	if cfg.MTU, err = c.Int("tun-mtu", 1500); err != nil {
 		return nil, err
