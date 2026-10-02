@@ -115,31 +115,57 @@ func (d Dir) GenTLSCryptV2ClientKey(name string, metadata []byte) (bool, error) 
 	if err != nil {
 		return false, fmt.Errorf("tls-crypt-v2 server key: %w", err)
 	}
-	k, err := NewTLSCryptV2ClientKey(srv, metadata)
+	return d.GenTLSCryptV2ClientKeyFrom(name, srv, metadata)
+}
+
+// GenTLSCryptV2ClientKeyFrom is GenTLSCryptV2ClientKey with the server key
+// given (for a server key kept outside the directory).
+func (d Dir) GenTLSCryptV2ClientKeyFrom(name string, serverKey, metadata []byte) (bool, error) {
+	if err := validName(name); err != nil {
+		return false, err
+	}
+	file := TLSCryptV2ClientKeyFile(name)
+	if d.Exists(file) {
+		return false, nil
+	}
+	k, err := NewTLSCryptV2ClientKey(serverKey, metadata)
 	if err != nil {
 		return false, err
 	}
 	return true, d.write(file, k, d.privateMode())
 }
 
-// wrapBlock is the profile section for wrap mode w.
-func (d Dir) wrapBlock(name string, w Wrap) (string, error) {
+// wrapBlock is the profile section for the control-channel protection in
+// opt.
+func (d Dir) wrapBlock(name string, opt ProfileOptions) (string, error) {
 	var file, tag, extra string
-	switch w {
+	switch opt.Wrap {
 	case WrapNone:
 		return "", nil
 	case WrapTLSAuth:
 		file, tag, extra = TLSAuthKeyFile, "tls-auth", "key-direction 1\n"
+		switch opt.KeyDirection {
+		case "", "1":
+		case "0":
+			extra = "key-direction 0\n"
+		case "none":
+			extra = ""
+		default:
+			return "", fmt.Errorf("invalid key direction %q", opt.KeyDirection)
+		}
 	case WrapTLSCrypt:
 		file, tag = TLSCryptKeyFile, "tls-crypt"
 	case WrapTLSCryptV2:
 		file, tag = TLSCryptV2ClientKeyFile(name), "tls-crypt-v2"
 	default:
-		return "", fmt.Errorf("unknown control-channel wrap %q", w)
+		return "", fmt.Errorf("unknown control-channel wrap %q", opt.Wrap)
 	}
-	k, err := d.Read(file)
-	if err != nil {
-		return "", fmt.Errorf("%s key: %w", tag, err)
+	k := opt.WrapKey
+	if k == nil {
+		var err error
+		if k, err = d.Read(file); err != nil {
+			return "", fmt.Errorf("%s key: %w", tag, err)
+		}
 	}
 	return fmt.Sprintf("<%s>\n%s</%s>\n%s", tag, k, tag, extra), nil
 }

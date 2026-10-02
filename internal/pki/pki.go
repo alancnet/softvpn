@@ -292,6 +292,17 @@ type ProfileOptions struct {
 	// Wrap embeds the client's control-channel key (tls-auth, tls-crypt or
 	// tls-crypt-v2) from the directory; see GenKey.
 	Wrap Wrap
+	// WrapKey, if set, is embedded instead of the directory's key file (the
+	// key the server actually uses, when it is kept elsewhere).
+	WrapKey []byte
+	// KeyDirection is the client's tls-auth key direction: "" for the usual
+	// "1", or "none" for a key used in both directions.
+	KeyDirection string
+	// TAP makes a "dev tap" profile, for servers in TAP mode.
+	TAP bool
+	// Extra lines, added after the standard options (e.g. "auth SHA256",
+	// "compress lz4-v2").
+	Extra []string
 }
 
 // Profile renders a .ovpn client profile with the certificates inlined, for
@@ -325,16 +336,23 @@ func (d Dir) Profile(name, remote string, port int, proto string, opts ...Profil
 			return "", err
 		}
 	}
-	wrap, err := d.wrapBlock(name, opt.Wrap)
+	wrap, err := d.wrapBlock(name, opt)
 	if err != nil {
 		return "", err
 	}
+	dev := "tun"
+	if opt.TAP {
+		dev = "tap"
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "# softvpn client profile for %q (stock OpenVPN 2.5+ client)\n", name)
-	fmt.Fprintf(&b, "client\ndev tun\nproto %s\nremote %s %d\n", proto, remote, port)
+	fmt.Fprintf(&b, "client\ndev %s\nproto %s\nremote %s %d\n", dev, proto, remote, port)
 	b.WriteString("nobind\nresolv-retry infinite\npersist-key\nremote-cert-tls server\nverb 3\n")
 	if opt.AuthUserPass || opt.NoCert {
 		b.WriteString("auth-user-pass\n")
+	}
+	for _, l := range opt.Extra {
+		b.WriteString(l + "\n")
 	}
 	fmt.Fprintf(&b, "<ca>\n%s</ca>\n", ca)
 	if !opt.NoCert {

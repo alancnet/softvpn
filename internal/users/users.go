@@ -13,12 +13,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/softvpn/softvpn/internal/fsutil"
 )
 
 // ErrBadCredentials is returned for an unknown user or a wrong password.
@@ -204,18 +205,12 @@ func update(path, name, password string, create, replace bool) error {
 }
 
 // edit rewrites a users file atomically (write to a temporary file, then
-// rename), so a running server never reads a half-written file. A missing
-// file counts as empty and is created with mode 0600.
+// rename), so a running server never reads a half-written file; a file that
+// cannot be renamed over (one bind-mounted into a container) is rewritten in
+// place. A missing file counts as empty and is created with mode 0600.
 func edit(path string, fn func([]line) ([]line, error)) error {
-	mode := os.FileMode(0o600)
 	lines, err := readLines(path)
-	switch {
-	case err == nil:
-		if fi, err := os.Stat(path); err == nil {
-			mode = fi.Mode().Perm()
-		}
-	case errors.Is(err, os.ErrNotExist):
-	default:
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if lines, err = fn(lines); err != nil {
@@ -229,23 +224,7 @@ func edit(path string, fn func([]line) ([]line, error)) error {
 			b.WriteString(l.raw + "\n")
 		}
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(b.String()); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return fsutil.WriteFile(path, []byte(b.String()), 0o600)
 }
 
 // DB is a users file loaded for authentication. Every lookup checks whether

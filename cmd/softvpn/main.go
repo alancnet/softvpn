@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,9 +19,11 @@ import (
 	"time"
 
 	"github.com/softvpn/softvpn/internal/config"
+	"github.com/softvpn/softvpn/internal/logbuf"
 	"github.com/softvpn/softvpn/internal/pki"
 	"github.com/softvpn/softvpn/internal/server"
 	"github.com/softvpn/softvpn/internal/users"
+	"github.com/softvpn/softvpn/internal/webui"
 )
 
 var version = "dev"
@@ -55,6 +58,10 @@ leaves out the client certificate (for "verify-client-cert none").
 moves its files to DIR/revoked/; "pki crl" re-signs the CRL. "user" manages
 the users file of auth-user-pass-file; without -password, the password is
 read from the first line of standard input.
+
+"--web-ui ADDR" (or "web-ui ADDR" in server.conf) serves the web UI on
+ADDR, e.g. 0.0.0.0:8443; the first start logs the generated admin password
+(or set SOFTVPN_WEB_PASSWORD).
 
 -wrap tls-auth|tls-crypt|tls-crypt-v2 protects the control channel: it
 creates the key (DIR/ta.key, DIR/tc.key or DIR/tls-crypt-v2.key, plus
@@ -102,23 +109,48 @@ func runServer(args []string) error {
 	if err != nil {
 		return err
 	}
-	level := slog.LevelInfo
-	switch {
-	case cfg.Verb >= 4:
-		level = slog.LevelDebug
-	case cfg.Verb == 0:
-		level = slog.LevelWarn
-	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-
-	srv, err := server.New(cfg, log)
+	webOpts, err := webui.ParseOptions(c, config.ConfigFile(args))
 	if err != nil {
 		return err
 	}
+	// The level follows "verb", which may change when the web UI applies a
+	// new configuration.
+	var level slog.LevelVar
+	setLevel := func(cfg *server.Config) {
+		switch {
+		case cfg.Verb >= 4:
+			level.Set(slog.LevelDebug)
+		case cfg.Verb == 0:
+			level.Set(slog.LevelWarn)
+		default:
+			level.Set(slog.LevelInfo)
+		}
+	}
+	setLevel(cfg)
+	// Recent log lines are kept in memory for the web UI.
+	ring := logbuf.New(2000)
+	log := slog.New(ring.Handler(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &level}), &level))
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	log.Info("softvpn starting", "version", version, "uid", os.Getuid())
-	return srv.Run(ctx)
+	sup := &server.Supervisor{Args: args, Log: log, OnStart: setLevel}
+	if webOpts != nil {
+		ui, err := webui.New(*webOpts, sup, ring, log, version)
+		if err != nil {
+			return err
+		}
+		ln, err := net.Listen("tcp", webOpts.Addr)
+		if err != nil {
+			return fmt.Errorf("web-ui: %w", err)
+		}
+		go func() {
+			if err := ui.ServeListener(ctx, ln); err != nil {
+				log.Error("web UI stopped", "err", err)
+			}
+		}()
+	}
+	return sup.Run(ctx, cfg)
 }
 
 func runPKI(args []string) error {

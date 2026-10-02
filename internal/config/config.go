@@ -81,6 +81,18 @@ func ParseFile(path string) (*Config, error) {
 	return c, nil
 }
 
+// ParseText parses text as if it were the contents of the file path:
+// positions name path and relative file names resolve against its
+// directory. It is how a candidate configuration is checked before it is
+// written.
+func ParseText(path, text string) (*Config, error) {
+	c := New()
+	if err := c.parse(strings.NewReader(text), path, filepath.Dir(path)); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
 // ParseString parses configuration text (used by tests and generated profiles).
 func ParseString(s string) (*Config, error) {
 	c := New()
@@ -149,6 +161,12 @@ func (c *Config) merge(o *Config) {
 // ParseArgs turns "--name a b --other c" into directives. "--config FILE"
 // loads FILE at that position.
 func ParseArgs(args []string) (*Config, error) {
+	return ParseArgsWith(args, nil)
+}
+
+// ParseArgsWith is ParseArgs, but a "--config FILE" for which override
+// returns ok uses the returned text instead of reading FILE.
+func ParseArgsWith(args []string, override func(file string) (text string, ok bool)) (*Config, error) {
 	c := New()
 	cwd, _ := os.Getwd()
 	for i := 0; i < len(args); {
@@ -166,7 +184,13 @@ func ParseArgs(args []string) (*Config, error) {
 			if len(d.Args) != 1 {
 				return nil, d.Errorf("expects one file name")
 			}
-			sub, err := ParseFile(d.Args[0])
+			var sub *Config
+			var err error
+			if text, ok := overridden(override, d.Args[0]); ok {
+				sub, err = ParseText(d.Args[0], text)
+			} else {
+				sub, err = ParseFile(d.Args[0])
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -176,6 +200,25 @@ func ParseArgs(args []string) (*Config, error) {
 		c.Directives = append(c.Directives, d)
 	}
 	return c, nil
+}
+
+func overridden(override func(string) (string, bool), file string) (string, bool) {
+	if override == nil {
+		return "", false
+	}
+	return override(file)
+}
+
+// ConfigFile returns the file named by the last "--config FILE" in args, or
+// "" if there is none.
+func ConfigFile(args []string) string {
+	file := ""
+	for i := 0; i+1 < len(args); i++ {
+		if strings.EqualFold(args[i], "--config") && !strings.HasPrefix(args[i+1], "--") {
+			file = args[i+1]
+		}
+	}
+	return file
 }
 
 // tokenize splits a line on whitespace, honouring double quotes and

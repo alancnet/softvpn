@@ -69,6 +69,21 @@ push "dhcp-option DNS 10.8.0.1"
 Any directive can also go on the command line, as with OpenVPN:
 `softvpn server --config server.conf --verb 4`.
 
+Optionally, manage it from a browser: keep `server.conf` in the PKI volume
+(read-write), add `web-ui 0.0.0.0:8443`, and publish the port. See
+[Web UI](#web-ui).
+
+```sh
+# copy server.conf into the volume (the image itself has no shell)
+docker run --rm -i -v softvpn-pki:/pki alpine sh -c \
+  'cat > /pki/server.conf && chown 65534:65534 /pki/server.conf' < server.conf
+docker run -d --name softvpn --read-only --cap-drop ALL \
+  --security-opt no-new-privileges -p 1194:1194/udp -p 8443:8443 \
+  -v softvpn-pki:/pki alancnet/softvpn server --config /pki/server.conf --web-ui 0.0.0.0:8443
+docker logs softvpn 2>&1 | grep 'administrator account'   # the first admin password
+# then open https://your-server:8443/
+```
+
 ### Control-channel keys
 
 `-wrap tls-auth|tls-crypt|tls-crypt-v2` on `pki init`, `pki client` and
@@ -187,10 +202,120 @@ share OpenVPN's common name `UNDEF` (add `duplicate-cn` in that case).
 `plugin`, `auth-user-pass-verify` and other script hooks are rejected at
 startup with a pointer to these directives.
 
+## Web UI
+
+An optional web interface manages the running server: a live dashboard,
+the configuration, client certificates and profiles, per-client settings,
+password users, and the log. It is built into the binary (no external
+resources, works offline) and needs no shell or capability, so the image
+stays the same locked-down scratch container.
+
+**Enabling it.** Add `web-ui ADDR` to `server.conf` (or `--web-ui ADDR` on
+the command line), mount the configuration's directory read-write, and
+publish the port:
+
+```sh
+# server.conf (with "web-ui 0.0.0.0:8443") lives in the PKI volume next to ca.crt
+docker run -d --name softvpn --read-only --cap-drop ALL \
+  --security-opt no-new-privileges -p 1194:1194/udp -p 8443:8443 \
+  -v softvpn-pki:/pki alancnet/softvpn server --config /pki/server.conf
+```
+
+The directory must be writable by the server's uid 65534: a named volume
+mounted at `/pki` is (the image's `/pki` belongs to that uid); for a bind
+mount, `chown -R 65534:65534` the host directory.
+
+Saving in the UI overwrites `server.conf` and applies it. **Backups are your
+responsibility**: the UI keeps no history. Mount a directory rather than a
+single file when you can; a bind-mounted single file works too (it is
+rewritten in place, since it cannot be replaced atomically), but the
+default administrator and certificate files need a writable directory next
+to it. With a read-only mount the UI still shows everything, and says why
+editing is off.
+
+**Logging in.** Every page needs an administrator login. On first start, if
+the administrators file (`web-ui.users` next to `server.conf`) does not
+exist, softvpn creates it with the user `admin` and a random password, and
+logs that password once:
+
+```
+level=WARN msg="web UI: created an administrator account; ..." user=admin password=... file=/etc/softvpn/web-ui.users
+```
+
+Alternatively set `SOFTVPN_WEB_PASSWORD`: it becomes `admin`'s password (in
+the file if it is writable, else in memory). The file is an htpasswd-style
+bcrypt file like `auth-user-pass-file`, so `softvpn user add -file
+/etc/softvpn/web-ui.users NAME` adds administrators, and logged-in
+administrators can change their password in the UI.
+
+**What it does.**
+
+- Dashboard: version, uptime, listeners, subnets, mode, and the connected
+  clients (name or user, real and virtual addresses, cipher, client version
+  and platform, traffic, connected time), updated live, with *Reconnect*
+  and *Disconnect* (the client is told to exit) per session.
+- Configuration: a form for the common settings (port and protocols,
+  subnets, routes, pushed options such as redirect-gateway and DNS,
+  client-to-client, keepalive, ciphers, compression, authentication, CRL,
+  client-config-dir, tls-auth/tls-crypt/tls-crypt-v2 with key generation,
+  NAT lists, verb), and the raw file with line numbers and live
+  validation. The form rewrites only the directives it changed and keeps
+  everything else, comments, order and inline `<ca>`/`<tls-*>` blocks
+  included. Every save is first validated exactly as the server loads its
+  configuration at startup; an invalid file is never written, and errors
+  point at their line. A valid one is written and the VPN engine restarts
+  in-process with it (the UI keeps running): connected clients are told to
+  reconnect (`RESTART`) and come back within seconds. If the new
+  configuration cannot start (its port is taken, say), the previous file is
+  put back and the previous configuration restarted, and the UI says so.
+  Directives given on the command line still apply on top of the file.
+- Clients: certificates issued from the PKI directory (`web-ui-pki`, by
+  default the `ca` file's directory if it holds `ca.key`), online status,
+  revoked ones. *New client* issues a certificate (optionally with a
+  password user of the same name); *Profile* downloads a `.ovpn` that
+  matches the running server: proto and port, its tls-auth/tls-crypt key or
+  a new per-client tls-crypt-v2 key, `auth-user-pass` when passwords are
+  required, no certificate with `verify-client-cert none`, `dev tap`,
+  `auth` and compression. *Revoke* updates `crl.pem`; with `crl-verify` the
+  server disconnects the client within seconds (the UI offers to add
+  `crl-verify` when it is missing). *Settings* edits the client's
+  `client-config-dir` file: static IPv4/IPv6 address, iroutes, extra pushed
+  options, push-reset, disable.
+- Password users (with `auth-user-pass-file`): add, change password,
+  delete, download a password-only profile. These files, the CRL and the
+  client-config-dir files take effect without a restart.
+- Logs: the most recent 2000 log lines, live, filterable and downloadable.
+
+**Security.** The UI serves HTTPS with a self-signed certificate made on
+first start (`web-ui.crt`/`web-ui.key` next to `server.conf`; its SHA-256
+fingerprint is logged), or your own with `web-ui-cert`/`web-ui-key`. Behind
+a TLS-terminating reverse proxy, `web-ui-http` serves plain HTTP (and logs
+a warning). Passwords are checked with bcrypt, and failed logins are
+limited (5 per address and 50 in total per 15 minutes). The session cookie
+is `HttpOnly`, `Secure` (unless `web-ui-http`) and `SameSite=Strict`; every
+change also needs the session's CSRF token in a header and a same-origin
+request, and responses carry a strict Content-Security-Policy. Secrets are
+never logged, except the one generated admin password. Anyone with an
+administrator login controls the VPN: expose the port only where you need
+it.
+
+| directive | |
+|---|---|
+| `web-ui ADDR` | listen address, e.g. `0.0.0.0:8443`; enables the UI (off by default) |
+| `web-ui-cert FILE`, `web-ui-key FILE` | TLS certificate and key (default: self-signed, kept next to `server.conf`) |
+| `web-ui-http` | plain HTTP, for use behind a TLS reverse proxy |
+| `web-ui-users FILE` | administrators (default: `web-ui.users` next to `server.conf`) |
+| `web-ui-pki DIR` | PKI directory for client certificates (default: the `ca` file's directory, if it has `ca.key`) |
+| `web-ui-remote HOST [PORT [PROTO]]` | what generated profiles connect to (default: the host name the browser used, and the server's port and first proto) |
+
+The `web-ui*` directives are read at process start; changing them in the UI
+takes effect at the next container start. The JSON API the UI uses is under
+`/api/` (see [internal/webui](internal/webui)).
+
 ## End-to-end test
 
 ```sh
-test/run.sh            # builds, runs 99 checks, tears down
+test/run.sh            # builds, runs 123 checks, tears down
 KEEP=1 test/run.sh     # leave it running afterwards
 ```
 
@@ -223,6 +348,9 @@ KEEP=1 test/run.sh     # leave it running afterwards
 | `tapclient2` | `tapedge` only | stock OpenVPN 2.5 with `dev tap` over TCP |
 | `dhcpserver` | `wan` + `dhcpedge` | softvpn with `dev tap` and `server-bridge` without arguments: DHCP only ([server-dhcp.conf](test/server-dhcp.conf)) |
 | `tapclient3` | `dhcpedge` only | stock OpenVPN 2.6 with `dev tap`, configured by `udhcpc` (which also needs `NET_RAW`) |
+| `webui-server` | `wan` + `edge` | softvpn with the web UI ([server-webui.conf](test/server-webui.conf)); locked down like `server`, its `/etc/softvpn` a writable volume (set up by the one-shot `webui-init` and `webui-pki`) |
+| `webui-client` | `edge` only | drives the web UI's API with curl and connects with the stock OpenVPN 2.6 client using the profiles it downloads |
+| `uitest` | `edge` only | headless Chromium (Playwright, [test/ui](test/ui)): logs in and visits every page at desktop and phone width, light and dark; fails on any JavaScript or console error. Screenshots go to `test/artifacts/` |
 
 `wan`, `edge` and `lan` are dual-stack. `edge`, `lan`, `tapedge` and
 `dhcpedge` are Docker `internal` networks, so anything a client reaches on
@@ -265,7 +393,16 @@ compressible data that the clients compress with LZ4, LZ4-v2, and LZO must
 reach the web server byte for byte (it checks a SHA-256), and with
 `allow-compression yes` the server's LZ4-compressed downloads must decompress
 in the clients. The clients' own OpenVPN statistics confirm that compression
-happened.
+happened. For the web UI: the generated admin password is logged once,
+a wrong password and a missing CSRF token are refused, a client created
+through the API connects with exactly the profile downloaded from it and
+reaches the web server through the NAT, a configuration change (a new
+pushed option and keepalive) restarts the engine in-process while the UI
+session survives, and the reconnected client receives the new options; an
+invalid configuration is refused with its line number and changes nothing;
+revoking the client through the API disconnects it within seconds; a
+password user added through the API connects with its password-only
+profile; *Disconnect* makes a client exit; and the browser test passes.
 
 No container is privileged. The OpenVPN *clients* get `/dev/net/tun` and the
 single capability `NET_ADMIN`, because the stock client always creates a
@@ -371,6 +508,10 @@ neither.
   - `nat-allow CIDR...` / `nat-deny CIDR...`: firewall for the soft NAT.
     Loopback, the VPN subnet, multicast, and link-local (cloud metadata) are
     always refused.
+  - `web-ui ADDR` and the other `web-ui-*` directives: the optional
+    [Web UI](#web-ui).
+  - Relative file names in `server.conf` (including `client-config-dir`)
+    are resolved against the file's directory.
 
 Directives that only matter to kernel OpenVPN (`dh`, `persist-tun`, `user`,
 and similar) are accepted and ignored, so existing configs load. Directives
@@ -398,7 +539,9 @@ softvpn doesn't implement are rejected at startup.
 |---|---|
 | [cmd/softvpn](cmd/softvpn/main.go) | CLI: `server`, `pki init/client/profile/revoke/crl/list/genkey`, `user add/passwd/del/list` |
 | [internal/ovpn](internal/ovpn) | OpenVPN protocol: packets, reliability layer, tls-auth/tls-crypt/tls-crypt-v2 and their key formats, TLS-over-control-channel, key exchange, data-channel crypto, UDP/TCP transports |
-| [internal/server](internal/server) | config, address pool, virtual router, soft-NAT policy, ICMP NAT; TAP mode's virtual switch and DHCP server |
+| [internal/server](internal/server) | config, address pool, virtual router, soft-NAT policy, ICMP NAT; TAP mode's virtual switch and DHCP server; the supervisor that restarts it with a new configuration |
+| [internal/webui](internal/webui) | the web UI: JSON API, login and sessions, structured config editing, profile generation, and the embedded front end ([static](internal/webui/static)) |
+| [internal/logbuf](internal/logbuf), [internal/fsutil](internal/fsutil) | recent log lines for the UI; atomic (or, for bind-mounted files, in-place) file writes |
 | [internal/vnet](internal/vnet) | gVisor stack in promiscuous/spoofing mode, TCP/UDP forwarders (the NAT) |
 | [internal/pki](internal/pki) | minimal CA (easy-rsa replacement), CRL, control-channel keys, and `.ovpn` profile generation |
 | [internal/users](internal/users) | user database for `auth-user-pass-file` (htpasswd-style bcrypt file) |
